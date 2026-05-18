@@ -1,0 +1,104 @@
+[project]
+name = "rspm-simulated-tasks"
+timezone = "Asia/Shanghai"
+
+[defaults]
+restart = "never"
+restart_delay = "1s"
+max_restarts = 5
+backoff = "exponential"
+max_backoff = "10s"
+kill_timeout = "5s"
+
+[tasks.long_watcher]
+cmd = "python3"
+args = [
+    "examples/tasks/long_running_task.py",
+    "--name",
+    "long-watcher",
+    "--interval-seconds",
+    "2",
+    "--ready-file",
+    ".rspm/example-state/long-watcher.ready",
+    "--watch-file",
+    "examples/tasks/watch_trigger.txt",
+]
+restart = "on-failure"
+autostart = false
+
+[tasks.long_watcher.env]
+RSPM_FAIL_PROBABILITY = "0.08"
+RSPM_WATCH_FILE = "examples/tasks/watch_trigger.txt"
+
+[tasks.long_watcher.health]
+type = "file"
+path = ".rspm/example-state/long-watcher.ready"
+interval = "1s"
+timeout = "500ms"
+success_after = 1
+failure_after = 1
+
+[tasks.long_watcher.watch]
+paths = ["examples/tasks/watch_trigger.txt"]
+
+[tasks.long_watcher.logs]
+max_bytes = 1048576
+max_age_seconds = 86400
+
+[tasks.oneshot_message]
+cmd = "python3"
+args = [
+    "examples/tasks/oneshot_task.py",
+    "--name",
+    "oneshot-message",
+    "--message",
+    "hello from rspm one-shot simulation",
+]
+restart = "never"
+autostart = false
+
+[tasks.periodic_pulse]
+cmd = "python3"
+args = [
+    "examples/tasks/periodic_task.py",
+    "--name",
+    "periodic-pulse",
+    "--sleep-seconds",
+    "0.2",
+]
+restart = "never"
+autostart = false
+
+[tasks.periodic_pulse.cron.every_15_seconds]
+expr = "*/15 * * * * *"
+action = "start"
+
+[tasks.market_feed]
+cmd = "python3"
+args = [
+    "examples/tasks/market_feed_task.py",
+    "--market",
+    "sim-ctp",
+    "--interval-seconds",
+    "3",
+    "--ready-file",
+    ".rspm/example-state/market-feed.ready",
+]
+restart = "on-failure"
+autostart = false
+
+[tasks.market_feed.health]
+type = "file"
+path = ".rspm/example-state/market-feed.ready"
+interval = "1s"
+timeout = "500ms"
+success_after = 1
+failure_after = 1
+
+[tasks.market_feed.schedule]
+start = "0 9 * * 1-5"
+stop = "1 15 * * 1-5"
+
+[tasks.market_feed.logs]
+max_bytes = 2097152
+max_age_seconds = 86400

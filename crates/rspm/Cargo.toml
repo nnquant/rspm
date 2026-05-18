@@ -1,0 +1,23 @@
+[package]
+name = "rspm"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "rspm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+rspm-core = { path = "../rspm-core" }
+rspm-daemon = { path = "../rspm-daemon" }
+rspm-sdk = { path = "../rspm-sdk" }
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

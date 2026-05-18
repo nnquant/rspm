@@ -1,0 +1,9 @@
+/target/
+/.pytest_cache/
+/python/.venv/
+/python/.pytest_cache/
+/python/rspm/__pycache__/
+/python/tests/__pycache__/
+__pycache__/
+*.py[cod]
+/.rspm/

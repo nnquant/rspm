@@ -1,0 +1,72 @@
+[project]
+name = "trading-stack"
+timezone = "Asia/Shanghai"
+
+[defaults]
+restart = "on-failure"
+restart_delay = "3s"
+max_restarts = 10
+backoff = "exponential"
+max_backoff = "60s"
+kill_timeout = "10s"
+
+[tasks.master]
+cmd = "uv"
+args = ["run", "ldc-master"]
+cwd = "/home/jiangda/services/local-market-data-center"
+autostart = true
+restart = "always"
+
+[tasks.master.env]
+RUST_LOG = "info"
+
+[tasks.master.health]
+type = "tcp"
+address = "127.0.0.1:17690"
+interval = "1s"
+timeout = "500ms"
+success_after = 2
+failure_after = 3
+
+[tasks.master.reload]
+mode = "command"
+command = "printf reload-master"
+
+[tasks.ctp_md]
+cmd = "uv"
+args = ["run", "ldc-ctp-md"]
+cwd = "/home/jiangda/services/local-market-data-center"
+depends_on = ["master"]
+start_when = "dependencies_healthy"
+restart = "on-failure"
+
+[tasks.ctp_md.schedule]
+start = "0 8 * * 1-5"
+stop = "0 16 * * 1-5"
+
+[tasks.ctp_md.watch]
+paths = ["/home/jiangda/services/local-market-data-center/config/ldc.toml"]
+
+[tasks.ctp_md.limits]
+max_memory_bytes = 1073741824
+
+[tasks.ctp_md.logs]
+max_bytes = 104857600
+max_age_seconds = 86400
+
+[tasks.strategy]
+cmd = "uv"
+args = ["run", "python", "scripts/run_strategy.py"]
+cwd = "/home/jiangda/services/local-market-data-center"
+depends_on = ["ctp_md"]
+start_when = "dependencies_healthy"
+restart = "on-failure"
+
+[tasks.strategy.cron.daily_restart]
+expr = "30 8 * * 1-5"
+action = "restart"
+
+[tasks.strategy.cron.preopen_check]
+expr = "20 8 * * 1-5"
+action = "command"
+command = "printf preopen-check"
