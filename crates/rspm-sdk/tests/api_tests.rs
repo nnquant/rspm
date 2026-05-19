@@ -49,3 +49,34 @@ async fn in_process_client_starts_and_lists_tasks() {
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].name, "echo");
 }
+
+#[tokio::test]
+async fn in_process_client_reads_aggregate_task_logs() {
+    let temp = TempDir::new().expect("temp dir");
+    let config = ProjectConfig::from_toml_str(
+        r#"
+        [project]
+        name = "sdk-aggregate-logs-test"
+
+        [tasks.alpha]
+        cmd = "sh"
+        args = ["-c", "printf alpha-log"]
+
+        [tasks.beta]
+        cmd = "sh"
+        args = ["-c", "printf beta-log"]
+        "#,
+    )
+    .expect("valid config");
+    let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
+    let mut client = RspmClient::from_runtime(runtime);
+
+    client.start("alpha").await.expect("start alpha");
+    client.wait_task_exit("alpha").await.expect("wait alpha");
+    client.start("beta").await.expect("start beta");
+    client.wait_task_exit("beta").await.expect("wait beta");
+    let logs = client.logs_all().await.expect("logs all");
+
+    assert_eq!(logs.get("alpha").map(String::as_str), Some("alpha-log"));
+    assert_eq!(logs.get("beta").map(String::as_str), Some("beta-log"));
+}

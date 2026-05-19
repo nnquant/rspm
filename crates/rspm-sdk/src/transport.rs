@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::path::Path;
@@ -13,6 +14,7 @@ use tokio::net::TcpStream;
 pub struct TcpRspmClient {
     reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
     writer: tokio::net::tcp::OwnedWriteHalf,
+    auth_token: Option<String>,
 }
 
 impl TcpRspmClient {
@@ -24,10 +26,17 @@ impl TcpRspmClient {
         Ok(Self {
             reader: BufReader::new(reader),
             writer,
+            auth_token: None,
         })
     }
 
-    pub async fn send(&mut self, request: RpcRequest) -> Result<RpcResponse> {
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
+
+    pub async fn send(&mut self, mut request: RpcRequest) -> Result<RpcResponse> {
+        attach_token(&mut request, self.auth_token.as_deref());
         let payload = serde_json::to_string(&request)?;
         self.writer.write_all(payload.as_bytes()).await?;
         self.writer.write_all(b"\n").await?;
@@ -77,6 +86,15 @@ impl TcpRspmClient {
             ))
             .await?;
         decode_result(response)
+    }
+
+    pub async fn logs_all(&mut self) -> Result<BTreeMap<String, String>> {
+        let tasks = self.list_tasks().await?;
+        let mut logs = BTreeMap::new();
+        for task in tasks {
+            logs.insert(task.name.clone(), self.logs(&task.name).await?);
+        }
+        Ok(logs)
     }
 
     pub async fn tail_logs(&mut self, task: &str) -> Result<String> {
@@ -154,6 +172,15 @@ impl TcpRspmClient {
             ))
             .await?;
         decode_result(response)
+    }
+}
+
+fn attach_token(request: &mut RpcRequest, token: Option<&str>) {
+    let Some(token) = token else {
+        return;
+    };
+    if let Some(params) = request.params.as_object_mut() {
+        params.insert("token".to_string(), serde_json::json!(token));
     }
 }
 

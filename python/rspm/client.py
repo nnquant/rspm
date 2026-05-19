@@ -23,6 +23,7 @@ class TaskInfo:
     started_at: str | None = None
     stopped_at: str | None = None
     uptime_ms: int | None = None
+    cpu_percent: float | None = None
     memory_bytes: int | None = None
     restart_count: int = 0
     last_exit_code: int | None = None
@@ -46,6 +47,7 @@ class TaskInfo:
             started_at=payload.get("started_at"),
             stopped_at=payload.get("stopped_at"),
             uptime_ms=payload.get("uptime_ms"),
+            cpu_percent=payload.get("cpu_percent"),
             memory_bytes=payload.get("memory_bytes"),
             restart_count=payload.get("restart_count", 0),
             last_exit_code=payload.get("last_exit_code"),
@@ -71,6 +73,7 @@ class RspmClient:
 
     endpoint: str = "local://default"
     _next_id: int = field(default=1, init=False)
+    _token: str | None = field(default=None, init=False, repr=False)
 
     @classmethod
     def connect_default(cls) -> "RspmClient":
@@ -107,14 +110,23 @@ class RspmClient:
         :rtype: dict[str, Any]
         """
 
+        params = dict(params or {})
+        if self._token is not None:
+            params["token"] = self._token
         request = {
             "jsonrpc": "2.0",
             "id": self._next_id,
             "method": method,
-            "params": params or {},
+            "params": params,
         }
         self._next_id += 1
         return request
+
+    def with_token(self, token: str) -> "RspmClient":
+        """Attach an authentication token to subsequent JSON-RPC requests."""
+
+        self._token = token
+        return self
 
     def start(self, task: str) -> dict[str, Any]:
         """Build a request to start a task."""
@@ -161,6 +173,15 @@ class RspmClient:
         """Read task logs through the same RPC path used by ``logs``."""
 
         return self.logs(task)
+
+    def logs_all(self) -> dict[str, str] | dict[str, Any]:
+        """Read logs for all tasks through the configured daemon transport."""
+
+        if not self.endpoint.startswith("tcp://"):
+            return self.build_request("task.list")
+
+        tasks = self.list_tasks()
+        return {task.name: self.logs(task.name) for task in tasks}
 
     def events(self) -> dict[str, Any]:
         """Build or send a request to list daemon events."""

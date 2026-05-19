@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -63,6 +64,14 @@ impl RspmClient {
 
     pub async fn logs(&self, task: &str) -> Result<String> {
         self.runtime.read_task_log(task)
+    }
+
+    pub async fn logs_all(&self) -> Result<BTreeMap<String, String>> {
+        let mut logs = BTreeMap::new();
+        for task in self.runtime.list_tasks()? {
+            logs.insert(task.name.clone(), self.runtime.read_task_log(&task.name)?);
+        }
+        Ok(logs)
     }
 
     pub async fn events(&self) -> Result<Vec<TaskEvent>> {

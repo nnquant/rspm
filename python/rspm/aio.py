@@ -35,6 +35,12 @@ class AsyncRspmClient:
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
         return None
 
+    def with_token(self, token: str) -> "AsyncRspmClient":
+        """Attach an authentication token to subsequent JSON-RPC requests."""
+
+        self._client.with_token(token)
+        return self
+
     async def start(self, task: str) -> dict[str, Any]:
         """Build a request to start a task."""
 
@@ -80,6 +86,15 @@ class AsyncRspmClient:
         """Read task logs through the same RPC path used by ``logs``."""
 
         return await self.logs(task)
+
+    async def logs_all(self) -> dict[str, str] | dict[str, Any]:
+        """Read logs for all tasks through the configured daemon transport."""
+
+        if not self._client.endpoint.startswith("tcp://"):
+            return self._client.build_request("task.list")
+
+        tasks = await self.list_tasks()
+        return {task.name: await self.logs(task.name) for task in tasks}
 
     async def events(self) -> dict[str, Any]:
         """Build or send a request to list daemon events."""
