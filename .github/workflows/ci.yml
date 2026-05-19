@@ -1,0 +1,97 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  linux:
+    name: linux-runtime
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: format
+        run: cargo fmt --all -- --check
+
+      - name: test
+        run: cargo test --workspace
+
+      - name: clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: smoke
+        run: scripts/smoke-posix.sh
+
+  platform-build:
+    name: platform-build-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: check
+        run: cargo check --workspace
+
+      - name: compile tests
+        run: cargo test --workspace --no-run
+
+      - name: service dry-run cli
+        run: cargo test -p rspm --test cli_tests service_
+
+      - name: named pipe transport
+        if: runner.os == 'Windows'
+        run: |
+          cargo test -p rspm-daemon --test server_tests named_pipe_json_line_transport_handles_task_list_request
+          cargo test -p rspm-sdk --test transport_tests named_pipe_sdk_client_sends_request_to_daemon_transport
+
+  platform-smoke:
+    name: platform-smoke-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            shell: bash
+            command: scripts/smoke-posix.sh
+          - os: windows-latest
+            shell: pwsh
+            command: .\scripts\smoke-windows.ps1
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: smoke
+        shell: ${{ matrix.shell }}
+        run: ${{ matrix.command }}
+
+  python:
+    name: python-sdk
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: test python sdk
+        working-directory: python
+        run: uv run python -m pytest -q
