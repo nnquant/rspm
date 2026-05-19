@@ -517,6 +517,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "libc",
  "rspm-core",
  "rspm-daemon",
  "rspm-sdk",

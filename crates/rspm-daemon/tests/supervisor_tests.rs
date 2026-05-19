@@ -4,10 +4,26 @@ use std::time::Duration;
 use rspm_core::config::ProjectConfig;
 use rspm_core::state::TaskStatus;
 use rspm_daemon::runtime::TaskRuntime;
+use rspm_daemon::runtime::{cpu_percent_from_proc_samples, ProcCpuSample};
 use tempfile::TempDir;
 
 fn config(input: &str) -> ProjectConfig {
     ProjectConfig::from_toml_str(input).expect("valid config")
+}
+
+#[test]
+fn computes_process_cpu_percent_from_proc_samples() {
+    let sample = ProcCpuSample {
+        process_ticks: 150,
+        process_start_ticks_since_boot: 1_000,
+        uptime_ticks_since_boot: 2_000,
+        clock_ticks_per_second: 100,
+        cpu_count: 2,
+    };
+
+    let percent = cpu_percent_from_proc_samples(sample).expect("cpu percent");
+
+    assert!((percent - 7.5).abs() < 0.001);
 }
 
 #[tokio::test]
@@ -95,6 +111,35 @@ async fn stops_long_running_task_and_updates_task_info() {
 
     assert_eq!(stopped.status, TaskStatus::Stopped);
     assert!(stopped.pid.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_task_sends_term_before_force_kill() {
+    let temp = TempDir::new().expect("temp dir");
+    let marker = temp.path().join("terminated");
+    let config = config(&format!(
+        r#"
+        [project]
+        name = "graceful-stop-test"
+
+        [defaults]
+        kill_timeout = "2s"
+
+        [tasks.sleeper]
+        cmd = "sh"
+        args = ["-c", "trap 'printf term > {}; exit 0' TERM; while true; do sleep 1; done"]
+        "#,
+        marker.display()
+    ));
+    let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
+
+    runtime.start_task("sleeper").await.expect("start task");
+    let stopped = runtime.stop_task("sleeper").await.expect("stop task");
+
+    assert_eq!(stopped.status, TaskStatus::Stopped);
+    assert_eq!(stopped.last_exit_code, Some(0));
+    assert_eq!(fs::read_to_string(marker).expect("marker"), "term");
 }
 
 #[tokio::test]

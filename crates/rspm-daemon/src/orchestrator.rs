@@ -1,5 +1,7 @@
 use anyhow::{bail, Result};
+use chrono::{DateTime, Utc};
 use rspm_core::dag::TaskGraph;
+use rspm_core::schedule::is_task_in_schedule_window;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -19,6 +21,22 @@ pub async fn start_autostart(runtime: &mut TaskRuntime) -> Result<Vec<TaskInfo>>
         if task.autostart {
             collect_with_dependencies(runtime_config(runtime), task_name, &mut selected)?;
         }
+    }
+    start_planned(runtime, Some(selected)).await
+}
+
+pub async fn start_scheduled_active(
+    runtime: &mut TaskRuntime,
+    now: DateTime<Utc>,
+) -> Result<Vec<TaskInfo>> {
+    let mut selected = BTreeSet::new();
+    for task_name in runtime_config(runtime).tasks.keys() {
+        if is_task_in_schedule_window(runtime_config(runtime), task_name, now)? {
+            collect_with_dependencies(runtime_config(runtime), task_name, &mut selected)?;
+        }
+    }
+    if selected.is_empty() {
+        return Ok(Vec::new());
     }
     start_planned(runtime, Some(selected)).await
 }

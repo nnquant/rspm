@@ -8,13 +8,14 @@ use serde::Deserialize;
 
 use rspm_core::config::ProjectConfig;
 
-use crate::orchestrator::{start_all, stop_all};
+use crate::orchestrator::{start_all, start_autostart, start_scheduled_active, stop_all};
 use crate::runtime::TaskRuntime;
 use crate::scheduler::run_due_actions;
 
 pub struct DaemonApi {
     runtime: TaskRuntime,
     applied_config_path: Option<PathBuf>,
+    auth_token: Option<String>,
 }
 
 impl DaemonApi {
@@ -22,6 +23,7 @@ impl DaemonApi {
         Self {
             runtime,
             applied_config_path: None,
+            auth_token: None,
         }
     }
 
@@ -30,8 +32,16 @@ impl DaemonApi {
         self
     }
 
+    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
+
     pub async fn handle(&mut self, request: RpcRequest) -> Result<RpcResponse> {
         let id = request.id;
+        if !self.is_authorized(&request.params) {
+            return Ok(RpcResponse::error(id, -32001, "unauthorized"));
+        }
         match self.handle_result(request).await {
             Ok(response) => Ok(response),
             Err(error) => Ok(RpcResponse::error(id, -32000, error.to_string())),
@@ -51,6 +61,20 @@ impl DaemonApi {
             .await?;
         let _ = self.runtime.reconcile_health_checks().await?;
         let _ = run_due_actions(&mut self.runtime, last_tick, now).await?;
+        Ok(())
+    }
+
+    pub async fn start_startup_tasks(&mut self) -> Result<()> {
+        if self
+            .runtime
+            .config()
+            .tasks
+            .values()
+            .any(|task| task.autostart)
+        {
+            let _ = start_autostart(&mut self.runtime).await?;
+        }
+        let _ = start_scheduled_active(&mut self.runtime, Utc::now()).await?;
         Ok(())
     }
 
@@ -106,6 +130,13 @@ impl DaemonApi {
             }
         };
         Ok(RpcResponse::success(id, result))
+    }
+
+    fn is_authorized(&self, params: &serde_json::Value) -> bool {
+        let Some(expected) = &self.auth_token else {
+            return true;
+        };
+        params.get("token").and_then(|token| token.as_str()) == Some(expected.as_str())
     }
 
     fn persist_applied_config(&self, toml_text: &str) -> Result<()> {

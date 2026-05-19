@@ -23,6 +23,7 @@ async fn main() -> Result<()> {
         log_dir: PathBuf::from(log_dir),
         state_dir: PathBuf::from(state_dir),
         socket_path: PathBuf::from(socket_path),
+        auth_token: std::env::var("RSPM_TOKEN").ok(),
     })
     .await
 }

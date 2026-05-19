@@ -45,6 +45,19 @@ fn validate_accepts_valid_config() {
 }
 
 #[test]
+fn cli_prints_version() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rspm"))
+        .arg("--version")
+        .output()
+        .expect("run cli");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(stdout.contains("rspm"));
+    assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
 fn apply_validates_config_and_prints_planned_task_count() {
     let (_temp, path) = write_config();
     let output = Command::new(env!("CARGO_BIN_EXE_rspm"))
@@ -209,6 +222,250 @@ async fn cli_status_starts_daemon_when_it_is_not_running() {
 }
 
 #[tokio::test]
+async fn cli_monit_once_prints_monitor_snapshot() {
+    let temp = TempDir::new().expect("temp dir");
+    let config_path = temp.path().join("rspm.toml");
+    let log_dir = temp.path().join("logs");
+    let state_dir = temp.path().join("state");
+    let socket_path = temp.path().join("run").join("rspmd.sock");
+    fs::write(
+        &config_path,
+        r#"
+        [project]
+        name = "cli-monit-once-test"
+
+        [tasks.sleeper]
+        cmd = "sh"
+        args = ["-c", "sleep 30"]
+        "#,
+    )
+    .expect("write config");
+
+    let output = run_cli(&[
+        "--addr",
+        &free_tcp_addr().to_string(),
+        "--log-dir",
+        &log_dir.display().to_string(),
+        "--state-dir",
+        &state_dir.display().to_string(),
+        "--socket-path",
+        &socket_path.display().to_string(),
+        "monit",
+        "--once",
+        "-f",
+        &config_path.display().to_string(),
+    ])
+    .await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(stdout.contains("MONIT"));
+    assert!(stdout.contains("sleeper"));
+
+    kill_daemon_from_state(&state_dir);
+}
+
+#[tokio::test]
+async fn cli_daemon_start_stop_and_restart_manage_daemon_lifecycle() {
+    let (temp, path) = write_config();
+    let address = free_tcp_addr();
+    let log_dir = temp.path().join("logs");
+    let state_dir = temp.path().join("state");
+    let socket_path = temp.path().join("run").join("rspmd.sock");
+    let address_text = address.to_string();
+    let log_dir_text = log_dir.display().to_string();
+    let state_dir_text = state_dir.display().to_string();
+    let socket_path_text = socket_path.display().to_string();
+
+    let start = run_cli(&[
+        "--addr",
+        &address_text,
+        "--log-dir",
+        &log_dir_text,
+        "--state-dir",
+        &state_dir_text,
+        "--socket-path",
+        &socket_path_text,
+        "daemon",
+        "start",
+        "-f",
+        &path,
+    ])
+    .await;
+    let start_stdout = String::from_utf8_lossy(&start.stdout);
+
+    assert!(start.status.success());
+    assert!(start_stdout.contains("daemon started"));
+    assert!(tokio::net::TcpStream::connect(address).await.is_ok());
+
+    let status = run_cli(&[
+        "--addr",
+        &address_text,
+        "--log-dir",
+        &log_dir_text,
+        "--state-dir",
+        &state_dir_text,
+        "--socket-path",
+        &socket_path_text,
+        "daemon",
+        "status",
+    ])
+    .await;
+    let status_stdout = String::from_utf8_lossy(&status.stdout);
+
+    assert!(status.status.success());
+    assert!(status_stdout.contains("daemon: running"));
+    assert!(status_stdout.contains(&address_text));
+
+    let restart = run_cli(&[
+        "--addr",
+        &address_text,
+        "--log-dir",
+        &log_dir_text,
+        "--state-dir",
+        &state_dir_text,
+        "--socket-path",
+        &socket_path_text,
+        "daemon",
+        "restart",
+        "-f",
+        &path,
+    ])
+    .await;
+    let restart_stdout = String::from_utf8_lossy(&restart.stdout);
+
+    assert!(restart.status.success());
+    assert!(restart_stdout.contains("daemon stopped"));
+    assert!(restart_stdout.contains("daemon started"));
+    assert!(tokio::net::TcpStream::connect(address).await.is_ok());
+
+    let stop = run_cli(&[
+        "--addr",
+        &address_text,
+        "--log-dir",
+        &log_dir_text,
+        "--state-dir",
+        &state_dir_text,
+        "--socket-path",
+        &socket_path_text,
+        "daemon",
+        "stop",
+    ])
+    .await;
+    let stop_stdout = String::from_utf8_lossy(&stop.stdout);
+
+    assert!(stop.status.success());
+    assert!(stop_stdout.contains("daemon stopped"));
+    assert!(tokio::net::TcpStream::connect(address).await.is_err());
+
+    let stopped_status = run_cli(&[
+        "--addr",
+        &address_text,
+        "--log-dir",
+        &log_dir_text,
+        "--state-dir",
+        &state_dir_text,
+        "--socket-path",
+        &socket_path_text,
+        "daemon",
+        "status",
+    ])
+    .await;
+    let stopped_status_stdout = String::from_utf8_lossy(&stopped_status.stdout);
+
+    assert!(stopped_status.status.success());
+    assert!(stopped_status_stdout.contains("daemon: stopped"));
+}
+
+#[tokio::test]
+async fn cli_daemon_restart_restores_running_tasks() {
+    let temp = TempDir::new().expect("temp dir");
+    let config_path = temp.path().join("rspm.toml");
+    fs::write(
+        &config_path,
+        r#"
+        [project]
+        name = "daemon-restart-restore-test"
+
+        [tasks.sleeper]
+        cmd = "sh"
+        args = ["-c", "sleep 30"]
+        "#,
+    )
+    .expect("write config");
+    let address = free_tcp_addr();
+    let log_dir = temp.path().join("logs");
+    let state_dir = temp.path().join("state");
+    let socket_path = temp.path().join("run").join("rspmd.sock");
+    let address_text = address.to_string();
+    let log_dir_text = log_dir.display().to_string();
+    let state_dir_text = state_dir.display().to_string();
+    let socket_path_text = socket_path.display().to_string();
+    let config_text = config_path.display().to_string();
+
+    let start_daemon = run_cli(&[
+        "--addr",
+        &address_text,
+        "--log-dir",
+        &log_dir_text,
+        "--state-dir",
+        &state_dir_text,
+        "--socket-path",
+        &socket_path_text,
+        "daemon",
+        "start",
+        "-f",
+        &config_text,
+    ])
+    .await;
+    assert!(start_daemon.status.success());
+
+    let start_task = run_cli(&["--addr", &address_text, "start", "sleeper"]).await;
+    assert!(start_task.status.success());
+
+    let restart_daemon = run_cli(&[
+        "--addr",
+        &address_text,
+        "--log-dir",
+        &log_dir_text,
+        "--state-dir",
+        &state_dir_text,
+        "--socket-path",
+        &socket_path_text,
+        "daemon",
+        "restart",
+        "-f",
+        &config_text,
+    ])
+    .await;
+    let restart_stdout = String::from_utf8_lossy(&restart_daemon.stdout);
+
+    assert!(restart_daemon.status.success());
+    assert!(restart_stdout.contains("task_id=1 sleeper online"));
+
+    let status = run_cli(&["--addr", &address_text, "ls"]).await;
+    let stdout = String::from_utf8_lossy(&status.stdout);
+
+    assert!(status.status.success());
+    assert!(stdout.contains("sleeper"));
+    assert!(stdout.contains("online"));
+
+    let _ = run_cli(&[
+        "--addr",
+        &address_text,
+        "--log-dir",
+        &log_dir_text,
+        "--state-dir",
+        &state_dir_text,
+        "--socket-path",
+        &socket_path_text,
+        "daemon",
+        "stop",
+    ])
+    .await;
+}
+
+#[tokio::test]
 async fn cli_status_requires_a_real_daemon_rpc_response_before_reusing_port() {
     let (temp, path) = write_config();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -312,6 +569,53 @@ fn service_install_activate_dry_run_prints_platform_activation_command() {
     assert!(stdout.contains("activation command"));
     if cfg!(target_os = "linux") {
         assert!(stdout.contains("systemctl --user"));
+    }
+}
+
+#[test]
+fn service_status_dry_run_prints_platform_status_command() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rspm"))
+        .args(["service", "status", "--dry-run"])
+        .output()
+        .expect("run cli");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(stdout.contains("status command"));
+    if cfg!(target_os = "linux") {
+        assert!(stdout.contains("systemctl --user status rspmd.service"));
+    }
+}
+
+#[test]
+fn service_start_stop_and_restart_dry_run_print_platform_commands() {
+    let start = Command::new(env!("CARGO_BIN_EXE_rspm"))
+        .args(["service", "start", "--dry-run"])
+        .output()
+        .expect("run cli");
+    let stop = Command::new(env!("CARGO_BIN_EXE_rspm"))
+        .args(["service", "stop", "--dry-run"])
+        .output()
+        .expect("run cli");
+    let restart = Command::new(env!("CARGO_BIN_EXE_rspm"))
+        .args(["service", "restart", "--dry-run"])
+        .output()
+        .expect("run cli");
+
+    let start_stdout = String::from_utf8_lossy(&start.stdout);
+    let stop_stdout = String::from_utf8_lossy(&stop.stdout);
+    let restart_stdout = String::from_utf8_lossy(&restart.stdout);
+
+    assert!(start.status.success());
+    assert!(stop.status.success());
+    assert!(restart.status.success());
+    assert!(start_stdout.contains("start command"));
+    assert!(stop_stdout.contains("stop command"));
+    assert!(restart_stdout.contains("restart command"));
+    if cfg!(target_os = "linux") {
+        assert!(start_stdout.contains("systemctl --user start rspmd.service"));
+        assert!(stop_stdout.contains("systemctl --user stop rspmd.service"));
+        assert!(restart_stdout.contains("systemctl --user restart rspmd.service"));
     }
 }
 
@@ -508,7 +812,11 @@ async fn cli_logs_reads_daemon_managed_task_log() {
 
         [tasks.echo]
         cmd = "sh"
-        args = ["-c", "printf '\\033[32mINFO\\033[0m cli-log-line\\n'"]
+        args = ["-c", "printf '\\033[32mINFO\\033[0m cli-log-line\\nDEBUG cli-log-tail\\n'"]
+
+        [tasks.second]
+        cmd = "sh"
+        args = ["-c", "printf second-log-line\\n"]
         "#,
     )
     .expect("valid config");
@@ -555,6 +863,157 @@ async fn cli_logs_reads_daemon_managed_task_log() {
     assert!(log_stdout_by_id.contains("echo | "));
     assert!(log_stdout_by_id.contains("cli-log-line"));
     assert!(log_stdout_by_id.contains("\x1b[32mINFO\x1b[0m"));
+
+    let aggregate_logs = run_cli(&["--addr", &address.to_string(), "logs"]).await;
+    let aggregate_stdout = String::from_utf8_lossy(&aggregate_logs.stdout);
+
+    assert!(aggregate_logs.status.success());
+    assert!(aggregate_stdout.contains("echo | "));
+    assert!(aggregate_stdout.contains("second | "));
+    assert!(aggregate_stdout.contains("cli-log-line"));
+    assert!(aggregate_stdout.contains("second-log-line"));
+
+    let aggregate_log = run_cli(&["--addr", &address.to_string(), "log", "--no-follow"]).await;
+    let aggregate_log_stdout = String::from_utf8_lossy(&aggregate_log.stdout);
+
+    assert!(aggregate_log.status.success());
+    assert!(aggregate_log_stdout.contains("echo | "));
+    assert!(aggregate_log_stdout.contains("second | "));
+
+    let tailed_logs = run_cli(&[
+        "--addr",
+        &address.to_string(),
+        "logs",
+        "echo",
+        "--lines",
+        "1",
+    ])
+    .await;
+    let tailed_stdout = String::from_utf8_lossy(&tailed_logs.stdout);
+
+    assert!(tailed_logs.status.success());
+    assert!(!tailed_stdout.contains("cli-log-line"));
+    assert!(tailed_stdout.contains("cli-log-tail"));
+
+    let grepped_logs = run_cli(&[
+        "--addr",
+        &address.to_string(),
+        "logs",
+        "--grep",
+        "second-log",
+    ])
+    .await;
+    let grepped_stdout = String::from_utf8_lossy(&grepped_logs.stdout);
+
+    assert!(grepped_logs.status.success());
+    assert!(!grepped_stdout.contains("cli-log-line"));
+    assert!(grepped_stdout.contains("second-log-line"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn cli_logs_merge_orders_aggregate_logs_by_timestamp() {
+    let temp = TempDir::new().expect("temp dir");
+    let config = ProjectConfig::from_toml_str(
+        r#"
+        [project]
+        name = "cli-log-merge-test"
+
+        [tasks.alpha]
+        cmd = "sh"
+        args = ["-c", "printf '2026-05-19T00:00:02Z alpha-two\\n2026-05-19T00:00:04Z alpha-four\\n'"]
+
+        [tasks.beta]
+        cmd = "sh"
+        args = ["-c", "printf '2026-05-19T00:00:01Z beta-one\\n2026-05-19T00:00:03Z beta-three\\n'"]
+        "#,
+    )
+    .expect("valid config");
+    let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
+    let api = DaemonApi::new(runtime);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address: SocketAddr = listener.local_addr().expect("addr");
+    drop(listener);
+
+    let server = tokio::spawn(async move {
+        serve_tcp(&address.to_string(), api)
+            .await
+            .expect("serve tcp");
+    });
+
+    wait_for_daemon(address).await;
+
+    let start = run_cli(&["--addr", &address.to_string(), "start", "all"]).await;
+    assert!(start.status.success());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let logs = run_cli(&["--addr", &address.to_string(), "logs", "--merge"]).await;
+    let stdout = String::from_utf8_lossy(&logs.stdout);
+    let beta_one = stdout.find("beta-one").expect("beta-one");
+    let alpha_two = stdout.find("alpha-two").expect("alpha-two");
+    let beta_three = stdout.find("beta-three").expect("beta-three");
+    let alpha_four = stdout.find("alpha-four").expect("alpha-four");
+
+    assert!(logs.status.success());
+    assert!(beta_one < alpha_two);
+    assert!(alpha_two < beta_three);
+    assert!(beta_three < alpha_four);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn cli_logs_since_filters_timestamped_lines() {
+    let temp = TempDir::new().expect("temp dir");
+    let config = ProjectConfig::from_toml_str(
+        r#"
+        [project]
+        name = "cli-log-since-test"
+
+        [tasks.alpha]
+        cmd = "sh"
+        args = ["-c", "printf '2026-05-19T00:00:01Z old-line\\n2026-05-19T00:00:03Z new-line\\nwithout-time\\n'"]
+        "#,
+    )
+    .expect("valid config");
+    let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
+    let api = DaemonApi::new(runtime);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address: SocketAddr = listener.local_addr().expect("addr");
+    drop(listener);
+
+    let server = tokio::spawn(async move {
+        serve_tcp(&address.to_string(), api)
+            .await
+            .expect("serve tcp");
+    });
+
+    wait_for_daemon(address).await;
+
+    let start = run_cli(&["--addr", &address.to_string(), "start", "all"]).await;
+    assert!(start.status.success());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let logs = run_cli(&[
+        "--addr",
+        &address.to_string(),
+        "logs",
+        "alpha",
+        "--since",
+        "2026-05-19T00:00:02Z",
+    ])
+    .await;
+    let stdout = String::from_utf8_lossy(&logs.stdout);
+
+    assert!(logs.status.success());
+    assert!(!stdout.contains("old-line"));
+    assert!(stdout.contains("new-line"));
+    assert!(!stdout.contains("without-time"));
 
     server.abort();
 }
@@ -689,7 +1148,64 @@ async fn cli_doctor_reports_reachable_daemon() {
 
     assert!(output.status.success());
     assert!(stdout.contains("daemon: ok"));
+    assert!(stdout.contains("platform:"));
+    assert!(stdout.contains("default_addr:"));
+    assert!(stdout.contains("auth_token:"));
+    assert!(stdout.contains("service_status_command:"));
+    assert!(stdout.contains("state_dir:"));
+    assert!(stdout.contains("pid_file:"));
+    assert!(stdout.contains("applied_config:"));
+    assert!(stdout.contains("event_log:"));
+    assert!(stdout.contains("socket_path:"));
     assert!(stdout.contains("tasks: 1"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn cli_sends_configured_auth_token_to_daemon() {
+    let temp = TempDir::new().expect("temp dir");
+    let config = ProjectConfig::from_toml_str(
+        r#"
+        [project]
+        name = "cli-auth-test"
+
+        [tasks.echo]
+        cmd = "true"
+        "#,
+    )
+    .expect("valid config");
+    let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
+    let api = DaemonApi::new(runtime).with_auth_token("secret-token");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address: SocketAddr = listener.local_addr().expect("addr");
+    drop(listener);
+
+    let server = tokio::spawn(async move {
+        serve_tcp(&address.to_string(), api)
+            .await
+            .expect("serve tcp");
+    });
+
+    wait_for_daemon(address).await;
+
+    let missing = run_cli(&["--addr", &address.to_string(), "--no-auto-daemon", "ls"]).await;
+    let accepted = run_cli(&[
+        "--addr",
+        &address.to_string(),
+        "--token",
+        "secret-token",
+        "--no-auto-daemon",
+        "ls",
+    ])
+    .await;
+    let accepted_stdout = String::from_utf8_lossy(&accepted.stdout);
+
+    assert!(!missing.status.success());
+    assert!(accepted.status.success());
+    assert!(accepted_stdout.contains("echo"));
 
     server.abort();
 }

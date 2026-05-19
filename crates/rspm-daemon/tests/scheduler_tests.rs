@@ -40,6 +40,38 @@ async fn scheduler_tick_starts_due_task() {
 }
 
 #[tokio::test]
+async fn task_info_reports_next_scheduled_action() {
+    let temp = TempDir::new().expect("temp dir");
+    let config = ProjectConfig::from_toml_str(
+        r#"
+        [project]
+        name = "next-info-test"
+        timezone = "Asia/Shanghai"
+
+        [tasks.market]
+        cmd = "true"
+
+        [tasks.market.schedule]
+        start = "30 8 * * *"
+        "#,
+    )
+    .expect("valid config");
+    let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
+
+    let info = runtime
+        .describe_task_at(
+            "market",
+            Utc.with_ymd_and_hms(2026, 5, 18, 0, 0, 0).unwrap(),
+        )
+        .expect("task info");
+
+    assert_eq!(
+        info.schedule_state.as_deref(),
+        Some("start 05-18 00:30:00Z")
+    );
+}
+
+#[tokio::test]
 async fn daemon_maintenance_tick_runs_scheduler_actions() {
     let temp = TempDir::new().expect("temp dir");
     let config = ProjectConfig::from_toml_str(

@@ -118,6 +118,94 @@ pub fn collect_due_actions(
     Ok(actions)
 }
 
+pub fn next_scheduled_action(
+    config: &ProjectConfig,
+    task_name: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<ScheduledAction>, cron::error::Error> {
+    let Some(task) = config.tasks.get(task_name) else {
+        return Ok(None);
+    };
+    let timezone = project_timezone(&config.project.timezone);
+    let mut actions = Vec::new();
+
+    if let Some(schedule) = &task.schedule {
+        if let Some(expr) = &schedule.start {
+            if let Some(due_at) = next_expr_due_at(expr, now, timezone)? {
+                actions.push(ScheduledAction {
+                    task: task_name.to_string(),
+                    kind: ScheduledActionKind::Start,
+                    name: None,
+                    command: None,
+                    due_at,
+                });
+            }
+        }
+        if let Some(expr) = &schedule.stop {
+            if let Some(due_at) = next_expr_due_at(expr, now, timezone)? {
+                actions.push(ScheduledAction {
+                    task: task_name.to_string(),
+                    kind: ScheduledActionKind::Stop,
+                    name: None,
+                    command: None,
+                    due_at,
+                });
+            }
+        }
+    }
+
+    for (name, cron_action) in &task.cron {
+        if let Some(due_at) = next_expr_due_at(&cron_action.expr, now, timezone)? {
+            actions.push(ScheduledAction {
+                task: task_name.to_string(),
+                kind: ScheduledActionKind::from_action_kind(&cron_action.action),
+                name: Some(name.clone()),
+                command: cron_action.command.clone(),
+                due_at,
+            });
+        }
+    }
+
+    actions.sort_by(|left, right| {
+        left.due_at
+            .cmp(&right.due_at)
+            .then_with(|| left.task.cmp(&right.task))
+    });
+    Ok(actions.into_iter().next())
+}
+
+pub fn is_task_in_schedule_window(
+    config: &ProjectConfig,
+    task_name: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, cron::error::Error> {
+    let Some(task) = config.tasks.get(task_name) else {
+        return Ok(false);
+    };
+    let Some(schedule) = &task.schedule else {
+        return Ok(false);
+    };
+    if schedule.start.is_none() || schedule.stop.is_none() {
+        return Ok(false);
+    }
+
+    let last_tick = now - Duration::days(370);
+    let mut latest_window_action = None;
+    for action in collect_due_actions(config, last_tick, now)? {
+        if action.task != task_name || action.name.is_some() {
+            continue;
+        }
+        if matches!(
+            action.kind,
+            ScheduledActionKind::Start | ScheduledActionKind::Stop
+        ) {
+            latest_window_action = Some(action.kind);
+        }
+    }
+
+    Ok(latest_window_action == Some(ScheduledActionKind::Start))
+}
+
 impl ScheduledActionKind {
     fn from_action_kind(action: &ActionKind) -> Self {
         match action {
@@ -171,6 +259,25 @@ fn collect_expr_actions(
         }
     }
     Ok(())
+}
+
+fn next_expr_due_at(
+    expr: &str,
+    now: DateTime<Utc>,
+    timezone: ProjectTimezone,
+) -> Result<Option<DateTime<Utc>>, cron::error::Error> {
+    let schedule = Schedule::from_str(&normalize_cron_expr(expr))?;
+    let next = match timezone {
+        ProjectTimezone::Iana(timezone) => schedule
+            .after(&now.with_timezone(&timezone))
+            .next()
+            .map(|due_at| due_at.with_timezone(&Utc)),
+        ProjectTimezone::Offset(offset) => schedule
+            .after(&(now + offset))
+            .next()
+            .map(|due_at| due_at - offset),
+    };
+    Ok(next)
 }
 
 fn project_timezone(timezone: &str) -> ProjectTimezone {

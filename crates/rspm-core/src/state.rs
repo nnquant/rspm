@@ -18,7 +18,7 @@ pub enum TaskStatus {
     Disabled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskInfo {
     #[serde(default)]
     pub task_id: u32,
@@ -31,6 +31,7 @@ pub struct TaskInfo {
     pub started_at: Option<DateTime<Utc>>,
     pub stopped_at: Option<DateTime<Utc>>,
     pub uptime_ms: Option<u64>,
+    pub cpu_percent: Option<f64>,
     pub memory_bytes: Option<u64>,
     pub restart_count: u32,
     pub last_exit_code: Option<i32>,

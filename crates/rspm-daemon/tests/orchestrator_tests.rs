@@ -1,8 +1,9 @@
 use std::fs;
 
+use chrono::{TimeZone, Utc};
 use rspm_core::config::{HealthCheck, HealthCheckKind, ProjectConfig};
 use rspm_daemon::health::check_health;
-use rspm_daemon::orchestrator::start_all;
+use rspm_daemon::orchestrator::{start_all, start_scheduled_active};
 use rspm_daemon::runtime::TaskRuntime;
 use tempfile::TempDir;
 
@@ -112,6 +113,56 @@ async fn successful_health_probe_marks_task_healthy() {
     assert_eq!(started[0].status, rspm_core::state::TaskStatus::Healthy);
     assert_eq!(started[0].health.as_deref(), Some("ok"));
 
+    runtime.stop_task("master").await.expect("cleanup master");
+}
+
+#[tokio::test]
+async fn scheduled_active_startup_starts_task_and_dependencies() {
+    let temp = TempDir::new().expect("temp dir");
+    let config = ProjectConfig::from_toml_str(
+        r#"
+        [project]
+        name = "scheduled-active-startup"
+        timezone = "Asia/Shanghai"
+
+        [tasks.master]
+        cmd = "sh"
+        args = ["-c", "sleep 30"]
+
+        [tasks.market]
+        cmd = "sh"
+        args = ["-c", "sleep 30"]
+        depends_on = ["master"]
+        start_when = "dependencies_started"
+
+        [tasks.market.schedule]
+        start = "30 8 * * *"
+        stop = "00 15 * * *"
+        "#,
+    )
+    .expect("valid config");
+    let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
+
+    let started = start_scheduled_active(
+        &mut runtime,
+        Utc.with_ymd_and_hms(2026, 5, 18, 1, 30, 0).unwrap(),
+    )
+    .await
+    .expect("scheduled active startup");
+
+    assert_eq!(started.len(), 2);
+    assert!(runtime
+        .describe_task("master")
+        .expect("master")
+        .pid
+        .is_some());
+    assert!(runtime
+        .describe_task("market")
+        .expect("market")
+        .pid
+        .is_some());
+
+    runtime.stop_task("market").await.expect("cleanup market");
     runtime.stop_task("master").await.expect("cleanup master");
 }
 

@@ -2,13 +2,14 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command as StdCommand, ExitStatus, Stdio};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use rspm_core::config::{BackoffMode, ProjectConfig, ReloadMode, RestartPolicy};
 use rspm_core::event::{EventType, TaskEvent};
+use rspm_core::schedule::{next_scheduled_action, ScheduledAction, ScheduledActionKind};
 use rspm_core::state::{TaskInfo, TaskStatus};
 use tokio::process::Command;
 
@@ -19,6 +20,7 @@ pub struct TaskRuntime {
     config: ProjectConfig,
     log_dir: PathBuf,
     running: BTreeMap<String, ManagedTask>,
+    restored_pids: BTreeMap<String, u32>,
     restart_counts: BTreeMap<String, u32>,
     last_started_at: BTreeMap<String, DateTime<Utc>>,
     last_stopped_at: BTreeMap<String, DateTime<Utc>>,
@@ -46,6 +48,7 @@ impl TaskRuntime {
             config,
             log_dir,
             running: BTreeMap::new(),
+            restored_pids: BTreeMap::new(),
             restart_counts: BTreeMap::new(),
             last_started_at: BTreeMap::new(),
             last_stopped_at: BTreeMap::new(),
@@ -60,6 +63,7 @@ impl TaskRuntime {
 
     pub fn with_event_log_path(mut self, path: impl AsRef<Path>) -> Self {
         self.event_log_path = Some(path.as_ref().to_path_buf());
+        self.restore_events_from_log();
         self
     }
 
@@ -103,6 +107,10 @@ impl TaskRuntime {
         if self.running.contains_key(task_name) {
             return self.describe_task(task_name);
         }
+        if self.restored_pid_if_alive(task_name).is_some() {
+            return self.describe_task(task_name);
+        }
+        self.restored_pids.remove(task_name);
 
         let task = self
             .config
@@ -160,19 +168,35 @@ impl TaskRuntime {
 
     pub async fn stop_task(&mut self, task_name: &str) -> Result<TaskInfo> {
         let Some(mut managed) = self.running.remove(task_name) else {
-            return self.describe_stopped_task(task_name, None);
+            if let Some(pid) = self.restored_pids.remove(task_name) {
+                if is_process_alive(pid) {
+                    terminate_pid(pid, self.kill_timeout())
+                        .await
+                        .with_context(|| format!("failed to stop restored task [{task_name}]"))?;
+                }
+                self.record_restored_task_stop(task_name, None);
+                let info = self.describe_stopped_task(task_name, None, Utc::now())?;
+                self.health_states.remove(task_name);
+                self.push_task_event(
+                    task_name,
+                    EventType::TaskStopped,
+                    Some(TaskStatus::Online),
+                    Some(TaskStatus::Stopped),
+                    Some("stop".to_string()),
+                );
+                return Ok(info);
+            }
+            return self.describe_stopped_task(task_name, None, Utc::now());
         };
 
         managed.status = TaskStatus::Stopping;
-        let _ = managed.child.kill().await;
-        let status = managed
-            .child
-            .wait()
+        let kill_timeout = self.kill_timeout();
+        let status = stop_child(&mut managed.child, kill_timeout)
             .await
-            .with_context(|| format!("failed to wait for task [{task_name}]"))?;
+            .with_context(|| format!("failed to stop task [{task_name}]"))?;
         let exit_code = status.code();
         self.record_task_stop(task_name, &managed, exit_code);
-        let info = self.describe_stopped_task(task_name, exit_code)?;
+        let info = self.describe_stopped_task(task_name, exit_code, Utc::now())?;
         self.health_states.remove(task_name);
         self.push_task_event(
             task_name,
@@ -264,11 +288,18 @@ impl TaskRuntime {
                 exited.push((task_name.clone(), status.code()));
             }
         }
+        for (task_name, pid) in &self.restored_pids {
+            if !is_process_alive(*pid) {
+                exited.push((task_name.clone(), None));
+            }
+        }
 
         let mut restarted = Vec::new();
         for (task_name, exit_code) in exited {
             if let Some(managed) = self.running.remove(&task_name) {
                 self.record_task_stop(&task_name, &managed, exit_code);
+            } else if self.restored_pids.remove(&task_name).is_some() {
+                self.record_restored_task_stop(&task_name, exit_code);
             }
             self.health_states.remove(&task_name);
             self.push_task_event(
@@ -351,7 +382,7 @@ impl TaskRuntime {
         F: Fn(u32) -> Option<u64>,
     {
         let mut exceeded = Vec::new();
-        for (task_name, managed) in &self.running {
+        for (task_name, pid) in self.running_pids() {
             let Some(limit) = self
                 .config
                 .task(task_name)?
@@ -359,9 +390,6 @@ impl TaskRuntime {
                 .as_ref()
                 .and_then(|limits| limits.max_memory_bytes)
             else {
-                continue;
-            };
-            let Some(pid) = managed.child.id() else {
                 continue;
             };
             if memory_bytes(pid).is_some_and(|used| used > limit) {
@@ -386,7 +414,12 @@ impl TaskRuntime {
 
     pub async fn reconcile_health_checks(&mut self) -> Result<Vec<TaskInfo>> {
         let mut changed = Vec::new();
-        let running_tasks = self.running.keys().cloned().collect::<Vec<_>>();
+        let running_tasks = self
+            .running
+            .keys()
+            .chain(self.restored_pids.keys())
+            .cloned()
+            .collect::<Vec<_>>();
 
         for task_name in running_tasks {
             let Some(health) = self
@@ -448,7 +481,23 @@ impl TaskRuntime {
 
     pub async fn wait_task_exit(&mut self, task_name: &str) -> Result<TaskInfo> {
         let Some(mut managed) = self.running.remove(task_name) else {
-            return self.describe_stopped_task(task_name, None);
+            if let Some(pid) = self.restored_pids.remove(task_name) {
+                while is_process_alive(pid) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                self.record_restored_task_stop(task_name, None);
+                let info = self.describe_stopped_task(task_name, None, Utc::now())?;
+                self.health_states.remove(task_name);
+                self.push_task_event(
+                    task_name,
+                    EventType::TaskStopped,
+                    Some(TaskStatus::Online),
+                    Some(TaskStatus::Stopped),
+                    Some("exit".to_string()),
+                );
+                return Ok(info);
+            }
+            return self.describe_stopped_task(task_name, None, Utc::now());
         };
 
         let status = managed
@@ -458,7 +507,7 @@ impl TaskRuntime {
             .with_context(|| format!("failed to wait for task [{task_name}]"))?;
         let exit_code = status.code();
         self.record_task_stop(task_name, &managed, exit_code);
-        let info = self.describe_stopped_task(task_name, exit_code)?;
+        let info = self.describe_stopped_task(task_name, exit_code, Utc::now())?;
         self.health_states.remove(task_name);
         self.push_task_event(
             task_name,
@@ -471,6 +520,10 @@ impl TaskRuntime {
     }
 
     pub fn describe_task(&self, task_name: &str) -> Result<TaskInfo> {
+        self.describe_task_at(task_name, Utc::now())
+    }
+
+    pub fn describe_task_at(&self, task_name: &str, now: DateTime<Utc>) -> Result<TaskInfo> {
         let task = self
             .config
             .task(task_name)
@@ -501,6 +554,7 @@ impl TaskRuntime {
                 started_at: Some(managed.started_at_utc),
                 stopped_at: None,
                 uptime_ms: Some(uptime_ms),
+                cpu_percent: managed.child.id().and_then(process_cpu_percent),
                 memory_bytes: managed.child.id().and_then(process_memory_bytes),
                 restart_count: self.restart_counts.get(task_name).copied().unwrap_or(0),
                 last_exit_code: managed.last_exit_code,
@@ -508,11 +562,53 @@ impl TaskRuntime {
                 cmd: task.cmd.clone(),
                 dependencies: task.depends_on.clone(),
                 dependents,
-                schedule_state: None,
+                schedule_state: self.next_schedule_state(task_name, now)?,
             });
         }
+        if let Some(pid) = self.restored_pids.get(task_name).copied() {
+            if is_process_alive(pid) {
+                let started_at = self.last_started_at.get(task_name).copied();
+                let uptime_ms = started_at.map(|started_at| {
+                    now.signed_duration_since(started_at)
+                        .num_milliseconds()
+                        .max(0) as u64
+                });
+                let health = self.health_states.get(task_name).copied();
+                let status = match health {
+                    Some(true) => TaskStatus::Healthy,
+                    Some(false) => TaskStatus::Unhealthy,
+                    None => TaskStatus::Online,
+                };
+                return Ok(TaskInfo {
+                    task_id: self.task_id(task_name)?,
+                    name: task_name.to_string(),
+                    run_mode: self.task_run_mode(task),
+                    pid: Some(pid),
+                    status,
+                    health: health.map(|is_healthy| {
+                        if is_healthy {
+                            "ok".to_string()
+                        } else {
+                            "fail".to_string()
+                        }
+                    }),
+                    started_at,
+                    stopped_at: None,
+                    uptime_ms,
+                    cpu_percent: process_cpu_percent(pid),
+                    memory_bytes: process_memory_bytes(pid),
+                    restart_count: self.restart_counts.get(task_name).copied().unwrap_or(0),
+                    last_exit_code: self.last_exit_codes.get(task_name).copied().flatten(),
+                    cwd: task.cwd.clone(),
+                    cmd: task.cmd.clone(),
+                    dependencies: task.depends_on.clone(),
+                    dependents,
+                    schedule_state: self.next_schedule_state(task_name, now)?,
+                });
+            }
+        }
 
-        self.describe_stopped_task(task_name, None)
+        self.describe_stopped_task(task_name, None, now)
     }
 
     pub fn list_tasks(&self) -> Result<Vec<TaskInfo>> {
@@ -549,7 +645,12 @@ impl TaskRuntime {
         self.push_task_event(task_name, event_type, None, None, Some(reason.into()));
     }
 
-    fn describe_stopped_task(&self, task_name: &str, exit_code: Option<i32>) -> Result<TaskInfo> {
+    fn describe_stopped_task(
+        &self,
+        task_name: &str,
+        exit_code: Option<i32>,
+        now: DateTime<Utc>,
+    ) -> Result<TaskInfo> {
         let task = self
             .config
             .task(task_name)
@@ -565,6 +666,7 @@ impl TaskRuntime {
             started_at: self.last_started_at.get(task_name).copied(),
             stopped_at: self.last_stopped_at.get(task_name).copied(),
             uptime_ms: self.last_uptime_ms.get(task_name).copied(),
+            cpu_percent: None,
             memory_bytes: None,
             restart_count: self.restart_counts.get(task_name).copied().unwrap_or(0),
             last_exit_code: exit_code
@@ -573,8 +675,12 @@ impl TaskRuntime {
             cmd: task.cmd.clone(),
             dependencies: task.depends_on.clone(),
             dependents: self.dependents(task_name),
-            schedule_state: None,
+            schedule_state: self.next_schedule_state(task_name, now)?,
         })
+    }
+
+    fn next_schedule_state(&self, task_name: &str, now: DateTime<Utc>) -> Result<Option<String>> {
+        Ok(next_scheduled_action(&self.config, task_name, now)?.map(format_next_action))
     }
 
     fn record_task_stop(&mut self, task_name: &str, managed: &ManagedTask, exit_code: Option<i32>) {
@@ -588,6 +694,51 @@ impl TaskRuntime {
         );
         self.last_exit_codes
             .insert(task_name.to_string(), exit_code);
+    }
+
+    fn record_restored_task_stop(&mut self, task_name: &str, exit_code: Option<i32>) {
+        let stopped_at = Utc::now();
+        self.last_stopped_at
+            .insert(task_name.to_string(), stopped_at);
+        if let Some(started_at) = self.last_started_at.get(task_name) {
+            self.last_uptime_ms.insert(
+                task_name.to_string(),
+                stopped_at
+                    .signed_duration_since(*started_at)
+                    .num_milliseconds()
+                    .max(0) as u64,
+            );
+        }
+        self.last_exit_codes
+            .insert(task_name.to_string(), exit_code);
+    }
+
+    fn kill_timeout(&self) -> Duration {
+        self.config
+            .defaults
+            .kill_timeout
+            .as_deref()
+            .and_then(parse_duration)
+            .unwrap_or_else(|| Duration::from_secs(5))
+    }
+
+    fn restored_pid_if_alive(&self, task_name: &str) -> Option<u32> {
+        self.restored_pids
+            .get(task_name)
+            .copied()
+            .filter(|pid| is_process_alive(*pid))
+    }
+
+    fn running_pids(&self) -> Vec<(&String, u32)> {
+        self.running
+            .iter()
+            .filter_map(|(task_name, managed)| managed.child.id().map(|pid| (task_name, pid)))
+            .chain(
+                self.restored_pids.iter().filter_map(|(task_name, pid)| {
+                    is_process_alive(*pid).then_some((task_name, *pid))
+                }),
+            )
+            .collect()
     }
 
     fn task_run_mode(&self, task: &rspm_core::config::TaskConfig) -> String {
@@ -692,6 +843,61 @@ impl TaskRuntime {
         }
     }
 
+    fn restore_events_from_log(&mut self) {
+        let Some(path) = &self.event_log_path else {
+            return;
+        };
+        let Ok(text) = fs::read_to_string(path) else {
+            return;
+        };
+
+        for line in text.lines() {
+            let Ok(event) = serde_json::from_str::<TaskEvent>(line) else {
+                continue;
+            };
+            self.restore_state_from_event(&event);
+            self.events.push(event);
+        }
+    }
+
+    fn restore_state_from_event(&mut self, event: &TaskEvent) {
+        let Some(task_name) = &event.task else {
+            return;
+        };
+        if !self.config.tasks.contains_key(task_name) {
+            return;
+        }
+
+        match event.event_type {
+            EventType::TaskStarted => {
+                self.last_started_at
+                    .insert(task_name.clone(), event.timestamp);
+                self.last_stopped_at.remove(task_name);
+                self.last_uptime_ms.remove(task_name);
+                self.last_exit_codes.remove(task_name);
+                if let Some(pid) = event.pid.filter(|pid| is_process_alive(*pid)) {
+                    self.restored_pids.insert(task_name.clone(), pid);
+                }
+            }
+            EventType::TaskStopped | EventType::TaskExited => {
+                self.restored_pids.remove(task_name);
+                self.last_stopped_at
+                    .insert(task_name.clone(), event.timestamp);
+                self.last_exit_codes
+                    .insert(task_name.clone(), event.exit_code);
+                if let Some(started_at) = self.last_started_at.get(task_name) {
+                    let uptime_ms = event
+                        .timestamp
+                        .signed_duration_since(*started_at)
+                        .num_milliseconds()
+                        .max(0) as u64;
+                    self.last_uptime_ms.insert(task_name.clone(), uptime_ms);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn should_restart(&self, task_name: &str, exit_code: Option<i32>) -> Result<bool> {
         let task = self
             .config
@@ -768,6 +974,130 @@ fn parse_duration(input: &str) -> Option<Duration> {
     input.parse::<u64>().ok().map(Duration::from_secs)
 }
 
+async fn stop_child(
+    child: &mut tokio::process::Child,
+    kill_timeout: Duration,
+) -> Result<ExitStatus> {
+    send_graceful_terminate(child).await?;
+    match tokio::time::timeout(kill_timeout, child.wait()).await {
+        Ok(status) => Ok(status?),
+        Err(_) => {
+            let _ = child.kill().await;
+            child
+                .wait()
+                .await
+                .context("failed to wait after force killing child")
+        }
+    }
+}
+
+async fn terminate_pid(pid: u32, kill_timeout: Duration) -> Result<()> {
+    send_term_to_pid(pid).await?;
+    let deadline = tokio::time::Instant::now() + kill_timeout;
+    while tokio::time::Instant::now() < deadline {
+        if !is_process_alive(pid) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    force_kill_pid(pid).await
+}
+
+#[cfg(unix)]
+async fn send_term_to_pid(pid: u32) -> Result<()> {
+    let status = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await?;
+    if !status.success() && is_process_alive(pid) {
+        anyhow::bail!("failed to send TERM to pid [{pid}]");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn send_term_to_pid(pid: u32) -> Result<()> {
+    let status = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await?;
+    if !status.success() && is_process_alive(pid) {
+        anyhow::bail!("failed to stop pid [{pid}] with taskkill");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn force_kill_pid(pid: u32) -> Result<()> {
+    let status = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await?;
+    if !status.success() && is_process_alive(pid) {
+        anyhow::bail!("failed to send KILL to pid [{pid}]");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn force_kill_pid(pid: u32) -> Result<()> {
+    let status = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await?;
+    if !status.success() && is_process_alive(pid) {
+        anyhow::bail!("failed to force stop pid [{pid}] with taskkill");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    StdCommand::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(windows)]
+fn is_process_alive(pid: u32) -> bool {
+    let Ok(output) = StdCommand::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success() && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+}
+
+async fn send_graceful_terminate(child: &tokio::process::Child) -> Result<()> {
+    let Some(pid) = child.id() else {
+        return Ok(());
+    };
+    if cfg!(target_os = "windows") {
+        return Ok(());
+    }
+    let status = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .await
+        .with_context(|| format!("failed to send TERM to pid [{pid}]"))?;
+    if !status.success() {
+        anyhow::bail!("failed to send TERM to pid [{pid}]");
+    }
+    Ok(())
+}
+
 fn rotate_log_if_needed(
     path: &Path,
     max_bytes: Option<u64>,
@@ -803,6 +1133,21 @@ fn rotate_log_if_needed(
     Ok(())
 }
 
+fn format_next_action(action: ScheduledAction) -> String {
+    let action_label = match action.kind {
+        ScheduledActionKind::Start => "start",
+        ScheduledActionKind::Stop => "stop",
+        ScheduledActionKind::Restart => "restart",
+        ScheduledActionKind::Reload => "reload",
+        ScheduledActionKind::Command => "command",
+    };
+    format!(
+        "{} {}",
+        action_label,
+        action.due_at.format("%m-%d %H:%M:%SZ")
+    )
+}
+
 pub fn process_memory_bytes(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -824,4 +1169,60 @@ pub fn process_memory_bytes(pid: u32) -> Option<u64> {
         let _ = pid;
         None
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProcCpuSample {
+    pub process_ticks: u64,
+    pub process_start_ticks_since_boot: u64,
+    pub uptime_ticks_since_boot: u64,
+    pub clock_ticks_per_second: u64,
+    pub cpu_count: usize,
+}
+
+pub fn cpu_percent_from_proc_samples(sample: ProcCpuSample) -> Option<f64> {
+    let elapsed_ticks = sample
+        .uptime_ticks_since_boot
+        .checked_sub(sample.process_start_ticks_since_boot)?;
+    if elapsed_ticks == 0 || sample.clock_ticks_per_second == 0 || sample.cpu_count == 0 {
+        return None;
+    }
+    let process_seconds = sample.process_ticks as f64 / sample.clock_ticks_per_second as f64;
+    let elapsed_seconds = elapsed_ticks as f64 / sample.clock_ticks_per_second as f64;
+    Some((process_seconds / elapsed_seconds) * 100.0 / sample.cpu_count as f64)
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_cpu_percent(pid: u32) -> Option<f64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (process_ticks, process_start_ticks_since_boot) = parse_process_stat_cpu(&stat)?;
+    let uptime = fs::read_to_string("/proc/uptime").ok()?;
+    let uptime_seconds = uptime.split_whitespace().next()?.parse::<f64>().ok()?;
+    let clock_ticks_per_second = 100;
+    let uptime_ticks_since_boot = (uptime_seconds * clock_ticks_per_second as f64) as u64;
+    let cpu_count = std::thread::available_parallelism().ok()?.get();
+
+    cpu_percent_from_proc_samples(ProcCpuSample {
+        process_ticks,
+        process_start_ticks_since_boot,
+        uptime_ticks_since_boot,
+        clock_ticks_per_second,
+        cpu_count,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_cpu_percent(pid: u32) -> Option<f64> {
+    let _ = pid;
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_process_stat_cpu(stat: &str) -> Option<(u64, u64)> {
+    let end_comm = stat.rfind(") ")?;
+    let fields = stat[end_comm + 2..].split_whitespace().collect::<Vec<_>>();
+    let utime = fields.get(11)?.parse::<u64>().ok()?;
+    let stime = fields.get(12)?.parse::<u64>().ok()?;
+    let start_time = fields.get(19)?.parse::<u64>().ok()?;
+    Some((utime + stime, start_time))
 }

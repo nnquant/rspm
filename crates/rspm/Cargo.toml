@@ -12,6 +12,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+libc.workspace = true
 rspm-core = { path = "../rspm-core" }
 rspm-daemon = { path = "../rspm-daemon" }
 rspm-sdk = { path = "../rspm-sdk" }

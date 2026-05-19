@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command as StdCommand, Stdio};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -18,6 +18,7 @@ use rspm_sdk::TcpRspmClient;
 #[derive(Debug, Parser)]
 #[command(name = "rspm")]
 #[command(about = "Rust task process manager")]
+#[command(version)]
 struct Cli {
     #[arg(long, global = true)]
     addr: Option<SocketAddr>,
@@ -30,6 +31,9 @@ struct Cli {
 
     #[arg(long, global = true, default_value = ".rspm/run/rspmd.sock")]
     socket_path: PathBuf,
+
+    #[arg(long, global = true)]
+    token: Option<String>,
 
     #[arg(long, global = true)]
     no_auto_daemon: bool,
@@ -65,8 +69,12 @@ enum Command {
         file: PathBuf,
     },
     Monit {
+        #[arg(short, long, default_value = "rspm.toml")]
+        file: PathBuf,
         #[arg(long, default_value_t = 2)]
         interval: u64,
+        #[arg(long)]
+        once: bool,
     },
     Start {
         #[arg(required = true)]
@@ -87,16 +95,36 @@ enum Command {
         task: String,
     },
     Logs {
-        task: String,
+        task: Option<String>,
         #[arg(short, long)]
         follow: bool,
+        #[arg(long)]
+        no_history: bool,
+        #[arg(long)]
+        lines: Option<usize>,
+        #[arg(long)]
+        grep: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        merge: bool,
     },
     Log {
-        task: String,
+        task: Option<String>,
         #[arg(short, long)]
         follow: bool,
         #[arg(long)]
         no_follow: bool,
+        #[arg(long)]
+        no_history: bool,
+        #[arg(long)]
+        lines: Option<usize>,
+        #[arg(long)]
+        grep: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        merge: bool,
     },
     Events,
     Doctor {
@@ -109,8 +137,26 @@ enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
-    #[command(hide = true)]
     Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    Start {
+        #[arg(short, long, default_value = "rspm.toml")]
+        file: PathBuf,
+    },
+    Stop,
+    Status,
+    Restart {
+        #[arg(short, long, default_value = "rspm.toml")]
+        file: PathBuf,
+    },
+    #[command(hide = true)]
+    Run {
         #[arg(default_value = "rspm.toml")]
         config: PathBuf,
         #[arg(default_value = "127.0.0.1:27691")]
@@ -121,6 +167,8 @@ enum Command {
         state_dir: PathBuf,
         #[arg(default_value = ".rspm/run/rspmd.sock")]
         socket_path: PathBuf,
+        #[arg(long)]
+        token: Option<String>,
     },
 }
 
@@ -151,6 +199,22 @@ enum ServiceCommand {
         #[arg(long)]
         activate: bool,
     },
+    Status {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    Start {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    Stop {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    Restart {
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -161,6 +225,7 @@ async fn main() -> Result<()> {
         cli.log_dir.clone(),
         cli.state_dir.clone(),
         cli.socket_path.clone(),
+        cli.token.or_else(|| std::env::var("RSPM_TOKEN").ok()),
         !cli.no_auto_daemon,
     );
 
@@ -189,7 +254,7 @@ async fn main() -> Result<()> {
                 let addr = daemon.ensure(&file).await?;
                 let text = fs::read_to_string(&file)
                     .with_context(|| format!("failed to read config [{}]", file.display()))?;
-                let tasks = daemon_apply(addr, &text).await?;
+                let tasks = daemon_apply(addr, &text, daemon.token()).await?;
                 println!("applied [{}] tasks={}", config.project.name, tasks.len());
                 for task in &tasks {
                     print_task_result(task);
@@ -207,19 +272,28 @@ async fn main() -> Result<()> {
         Command::Status { file } | Command::Ls { file } => {
             if daemon.should_use_daemon() {
                 let addr = daemon.ensure(&file).await?;
-                let tasks = daemon_list(addr).await?;
+                let tasks = daemon_list(addr, daemon.token()).await?;
                 print_task_status(&tasks);
             } else {
                 let config = read_config(&file)?;
                 print_offline_status(&config);
             }
         }
-        Command::Monit { interval } => {
-            let addr = daemon.ensure(&PathBuf::from("rspm.toml")).await?;
+        Command::Monit {
+            file,
+            interval,
+            once,
+        } => {
+            let addr = daemon.ensure(&file).await?;
+            if once {
+                let tasks = daemon_list(addr, daemon.token()).await?;
+                print_monit_snapshot(addr, &tasks);
+                return Ok(());
+            }
             loop {
                 print!("\x1B[2J\x1B[H");
-                let tasks = daemon_list(addr).await?;
-                print_task_status(&tasks);
+                let tasks = daemon_list(addr, daemon.token()).await?;
+                print_monit_snapshot(addr, &tasks);
                 std::io::stdout().flush()?;
                 tokio::time::sleep(std::time::Duration::from_secs(interval.max(1))).await;
             }
@@ -227,88 +301,129 @@ async fn main() -> Result<()> {
         Command::Start { tasks } => {
             let addr = daemon.ensure(&PathBuf::from("rspm.toml")).await?;
             if is_all_target(&tasks) {
-                let tasks = daemon_all_action(addr, "task.start_all").await?;
+                let tasks = daemon_all_action(addr, "task.start_all", daemon.token()).await?;
                 for info in &tasks {
                     print_task_result(info);
                 }
             } else {
-                for task in resolve_task_targets(addr, &tasks).await? {
-                    let info = daemon_task_action(addr, "task.start", &task).await?;
+                for task in resolve_task_targets(addr, &tasks, daemon.token()).await? {
+                    let info =
+                        daemon_task_action(addr, "task.start", &task, daemon.token()).await?;
                     print_task_result(&info);
                 }
             }
-            print_daemon_status(addr).await?;
+            print_daemon_status(addr, daemon.token()).await?;
         }
         Command::Stop { tasks } => {
             let addr = daemon.ensure(&PathBuf::from("rspm.toml")).await?;
             if is_all_target(&tasks) {
-                let tasks = daemon_all_action(addr, "task.stop_all").await?;
+                let tasks = daemon_all_action(addr, "task.stop_all", daemon.token()).await?;
                 for info in &tasks {
                     print_task_result(info);
                 }
             } else {
-                for task in resolve_task_targets(addr, &tasks).await? {
-                    let info = daemon_task_action(addr, "task.stop", &task).await?;
+                for task in resolve_task_targets(addr, &tasks, daemon.token()).await? {
+                    let info = daemon_task_action(addr, "task.stop", &task, daemon.token()).await?;
                     print_task_result(&info);
                 }
             }
-            print_daemon_status(addr).await?;
+            print_daemon_status(addr, daemon.token()).await?;
         }
         Command::Restart { tasks } => {
             let addr = daemon.ensure(&PathBuf::from("rspm.toml")).await?;
-            for task in resolve_task_targets(addr, &tasks).await? {
-                let info = daemon_task_action(addr, "task.restart", &task).await?;
+            for task in resolve_task_targets(addr, &tasks, daemon.token()).await? {
+                let info = daemon_task_action(addr, "task.restart", &task, daemon.token()).await?;
                 print_task_result(&info);
             }
-            print_daemon_status(addr).await?;
+            print_daemon_status(addr, daemon.token()).await?;
         }
         Command::Describe { task } => {
             let addr = daemon.ensure(&PathBuf::from("rspm.toml")).await?;
-            let task = resolve_task_target(addr, &task).await?;
-            let info = daemon_task_action(addr, "task.describe", &task).await?;
+            let task = resolve_task_target(addr, &task, daemon.token()).await?;
+            let info = daemon_task_action(addr, "task.describe", &task, daemon.token()).await?;
             print_task_description(&info);
         }
         Command::Reload { task } => {
             let addr = daemon.ensure(&PathBuf::from("rspm.toml")).await?;
-            let task = resolve_task_target(addr, &task).await?;
-            let info = daemon_task_action(addr, "task.reload", &task).await?;
+            let task = resolve_task_target(addr, &task, daemon.token()).await?;
+            let info = daemon_task_action(addr, "task.reload", &task, daemon.token()).await?;
             print_task_result(&info);
-            print_daemon_status(addr).await?;
+            print_daemon_status(addr, daemon.token()).await?;
         }
-        Command::Logs { task, follow } => {
+        Command::Logs {
+            task,
+            follow,
+            no_history,
+            lines,
+            grep,
+            since,
+            merge,
+        } => {
             let addr = daemon.ensure(&PathBuf::from("rspm.toml")).await?;
-            let task = resolve_task_target(addr, &task).await?;
+            let tasks = resolve_log_targets(addr, task.as_deref(), daemon.token()).await?;
+            let since = parse_since_timestamp(since.as_deref())?;
+            let options = LogPrintOptions {
+                lines,
+                grep: grep.as_deref(),
+                since,
+                merge,
+            };
             if follow {
-                follow_logs(addr, &task).await?;
+                follow_logs(addr, &tasks, !no_history, options, daemon.token()).await?;
             } else {
-                let logs = daemon_task_logs(addr, &task).await?;
-                print_prefixed_logs(&task, &logs)?;
+                print_task_logs(addr, &tasks, options, daemon.token()).await?;
             }
         }
         Command::Log {
             task,
             follow,
             no_follow,
+            no_history,
+            lines,
+            grep,
+            since,
+            merge,
         } => {
             let addr = daemon.ensure(&PathBuf::from("rspm.toml")).await?;
-            let task = resolve_task_target(addr, &task).await?;
+            let tasks = resolve_log_targets(addr, task.as_deref(), daemon.token()).await?;
+            let since = parse_since_timestamp(since.as_deref())?;
+            let options = LogPrintOptions {
+                lines,
+                grep: grep.as_deref(),
+                since,
+                merge,
+            };
             if follow || !no_follow {
-                follow_logs(addr, &task).await?;
+                follow_logs(addr, &tasks, !no_history, options, daemon.token()).await?;
             } else {
-                let logs = daemon_task_logs(addr, &task).await?;
-                print_prefixed_logs(&task, &logs)?;
+                print_task_logs(addr, &tasks, options, daemon.token()).await?;
             }
         }
         Command::Events => {
             let addr = daemon.ensure(&PathBuf::from("rspm.toml")).await?;
-            let events = daemon_events(addr).await?;
+            let events = daemon_events(addr, daemon.token()).await?;
             print_events(&events);
         }
         Command::Doctor { config, log_dir } => {
             let doctor_daemon = daemon.with_log_dir(log_dir.clone());
             let addr = doctor_daemon.ensure(&config).await?;
-            let tasks = daemon_list(addr).await?;
+            let tasks = daemon_list(addr, daemon.token()).await?;
             println!("daemon: ok addr=[{addr}]");
+            println!(
+                "platform: os=[{}] arch=[{}]",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            );
+            println!("default_addr: {}", default_daemon_addr());
+            println!(
+                "auth_token: {}",
+                if doctor_daemon.token().is_some() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            println!("service_status_command: {}", status_commands().join(" && "));
             println!(
                 "config: {} path=[{}]",
                 if config.exists() { "ok" } else { "missing" },
@@ -318,6 +433,38 @@ async fn main() -> Result<()> {
                 "log_dir: {} path=[{}]",
                 if log_dir.exists() { "ok" } else { "missing" },
                 log_dir.display()
+            );
+            println!(
+                "state_dir: {} path=[{}]",
+                if doctor_daemon.state_dir.exists() {
+                    "ok"
+                } else {
+                    "missing"
+                },
+                doctor_daemon.state_dir.display()
+            );
+            println!(
+                "pid_file: {} path=[{}]",
+                pid_file_state(&doctor_daemon.state_dir.join("rspmd.pid")),
+                doctor_daemon.state_dir.join("rspmd.pid").display()
+            );
+            println!(
+                "applied_config: {} path=[{}]",
+                if doctor_daemon.state_dir.join("applied.toml").exists() {
+                    "ok"
+                } else {
+                    "missing"
+                },
+                doctor_daemon.state_dir.join("applied.toml").display()
+            );
+            println!(
+                "event_log: {} path=[{}]",
+                event_log_state(&doctor_daemon.state_dir.join("events.jsonl")),
+                doctor_daemon.state_dir.join("events.jsonl").display()
+            );
+            println!(
+                "socket_path: path=[{}]",
+                doctor_daemon.socket_path.display()
             );
             println!("permission: ok cwd-writable=[{}]", cwd_writable());
             println!("tasks: {}", tasks.len());
@@ -371,23 +518,73 @@ async fn main() -> Result<()> {
                     println!("service file removed [{}]", path.display());
                 }
             }
+            ServiceCommand::Status { dry_run } => {
+                let path = default_service_path();
+                println!(
+                    "service_file: {} path=[{}]",
+                    if path.exists() { "ok" } else { "missing" },
+                    path.display()
+                );
+                if dry_run {
+                    print_status_commands();
+                } else {
+                    run_shell_commands(&status_commands()).await?;
+                }
+            }
+            ServiceCommand::Start { dry_run } => {
+                if dry_run {
+                    print_service_commands("start", &start_commands());
+                } else {
+                    run_shell_commands(&start_commands()).await?;
+                }
+            }
+            ServiceCommand::Stop { dry_run } => {
+                if dry_run {
+                    print_service_commands("stop", &stop_commands());
+                } else {
+                    run_shell_commands(&stop_commands()).await?;
+                }
+            }
+            ServiceCommand::Restart { dry_run } => {
+                if dry_run {
+                    print_service_commands("restart", &restart_commands());
+                } else {
+                    run_shell_commands(&restart_commands()).await?;
+                }
+            }
         },
-        Command::Daemon {
-            config,
-            listen_addr,
-            log_dir,
-            state_dir,
-            socket_path,
-        } => {
-            run_daemon(DaemonOptions {
-                config_path: config,
-                address: listen_addr,
+        Command::Daemon { command } => match command {
+            DaemonCommand::Start { file } => {
+                daemon.start(&file).await?;
+            }
+            DaemonCommand::Stop => {
+                daemon.stop().await?;
+            }
+            DaemonCommand::Status => {
+                daemon.status().await?;
+            }
+            DaemonCommand::Restart { file } => {
+                daemon.restart(&file).await?;
+            }
+            DaemonCommand::Run {
+                config,
+                listen_addr,
                 log_dir,
                 state_dir,
                 socket_path,
-            })
-            .await?;
-        }
+                token,
+            } => {
+                run_daemon(DaemonOptions {
+                    config_path: config,
+                    address: listen_addr,
+                    log_dir,
+                    state_dir,
+                    socket_path,
+                    auth_token: token,
+                })
+                .await?;
+            }
+        },
     }
 
     Ok(())
@@ -454,7 +651,8 @@ fn print_task_status(tasks: &[TaskInfo]) {
         let status = colored_status_cell(task.status);
         let health = colored_health_cell(task.health.as_deref().unwrap_or("-"));
         let restarts = colored_restarts_cell(task.restart_count);
-        let cpu = colored_cpu_cell("-");
+        let cpu_text = task.cpu_percent.map(format_cpu_percent);
+        let cpu = colored_cpu_cell(cpu_text.as_deref().unwrap_or("-"));
         let memory = colored_memory_cell(task.memory_bytes);
         let pid = task
             .pid
@@ -491,6 +689,22 @@ fn print_task_status(tasks: &[TaskInfo]) {
             task.schedule_state.as_deref().unwrap_or("-")
         );
     }
+}
+
+fn print_monit_snapshot(addr: SocketAddr, tasks: &[TaskInfo]) {
+    let running = tasks.iter().filter(|task| task.pid.is_some()).count();
+    let unhealthy = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Unhealthy)
+        .count();
+    println!(
+        "MONIT addr=[{}] tasks={} running={} unhealthy={}",
+        addr,
+        tasks.len(),
+        running,
+        unhealthy
+    );
+    print_task_status(tasks);
 }
 
 fn print_task_result(task: &TaskInfo) {
@@ -621,19 +835,27 @@ fn is_all_target(tasks: &[String]) -> bool {
     tasks.len() == 1 && tasks[0] == "all"
 }
 
-async fn print_daemon_status(addr: SocketAddr) -> Result<()> {
-    let tasks = daemon_list(addr).await?;
+async fn print_daemon_status(addr: SocketAddr, token: Option<&str>) -> Result<()> {
+    let tasks = daemon_list(addr, token).await?;
     print_task_status(&tasks);
     Ok(())
 }
 
-async fn resolve_task_target(addr: SocketAddr, target: &str) -> Result<String> {
+async fn resolve_task_target(
+    addr: SocketAddr,
+    target: &str,
+    token: Option<&str>,
+) -> Result<String> {
     let targets = [target.to_string()];
-    let mut resolved = resolve_task_targets(addr, &targets).await?;
+    let mut resolved = resolve_task_targets(addr, &targets, token).await?;
     Ok(resolved.remove(0))
 }
 
-async fn resolve_task_targets(addr: SocketAddr, targets: &[String]) -> Result<Vec<String>> {
+async fn resolve_task_targets(
+    addr: SocketAddr,
+    targets: &[String],
+    token: Option<&str>,
+) -> Result<Vec<String>> {
     let mut resolved = Vec::with_capacity(targets.len());
     let mut task_list = None;
 
@@ -641,7 +863,7 @@ async fn resolve_task_targets(addr: SocketAddr, targets: &[String]) -> Result<Ve
         if let Ok(task_id) = target.parse::<u32>() {
             let tasks = match &task_list {
                 Some(tasks) => tasks,
-                None => task_list.insert(daemon_list(addr).await?),
+                None => task_list.insert(daemon_list(addr, token).await?),
             };
             let Some(task) = tasks.iter().find(|task| task.task_id == task_id) else {
                 anyhow::bail!("task_id [{task_id}] not found");
@@ -655,6 +877,21 @@ async fn resolve_task_targets(addr: SocketAddr, targets: &[String]) -> Result<Ve
     Ok(resolved)
 }
 
+async fn resolve_log_targets(
+    addr: SocketAddr,
+    target: Option<&str>,
+    token: Option<&str>,
+) -> Result<Vec<String>> {
+    match target {
+        Some("all") | None => Ok(daemon_list(addr, token)
+            .await?
+            .into_iter()
+            .map(|task| task.name)
+            .collect()),
+        Some(target) => Ok(vec![resolve_task_target(addr, target, token).await?]),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DaemonLaunch {
     addr: SocketAddr,
@@ -662,6 +899,7 @@ struct DaemonLaunch {
     log_dir: PathBuf,
     state_dir: PathBuf,
     socket_path: PathBuf,
+    auth_token: Option<String>,
     auto_launch: bool,
 }
 
@@ -671,6 +909,7 @@ impl DaemonLaunch {
         log_dir: PathBuf,
         state_dir: PathBuf,
         socket_path: PathBuf,
+        auth_token: Option<String>,
         auto_launch: bool,
     ) -> Self {
         Self {
@@ -679,8 +918,13 @@ impl DaemonLaunch {
             log_dir,
             state_dir,
             socket_path,
+            auth_token,
             auto_launch,
         }
+    }
+
+    fn token(&self) -> Option<&str> {
+        self.auth_token.as_deref()
     }
 
     fn should_use_daemon(&self) -> bool {
@@ -693,15 +937,105 @@ impl DaemonLaunch {
         next
     }
 
+    async fn start(&self, config: &Path) -> Result<()> {
+        if probe_daemon(self.addr, self.token()).await.is_ok() {
+            println!("daemon already running addr=[{}]", self.addr);
+            return Ok(());
+        }
+        self.spawn(config)?;
+        wait_for_daemon(self.addr, self.token()).await?;
+        let pid = fs::read_to_string(self.state_dir.join("rspmd.pid"))
+            .ok()
+            .map(|pid| pid.trim().to_string())
+            .filter(|pid| !pid.is_empty())
+            .unwrap_or_else(|| "-".to_string());
+        println!("daemon started addr=[{}] pid=[{}]", self.addr, pid);
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<()> {
+        let was_running = probe_daemon(self.addr, self.token()).await.is_ok();
+        if was_running {
+            let _ = daemon_all_action(self.addr, "task.stop_all", self.token()).await?;
+        }
+
+        let pid_path = self.state_dir.join("rspmd.pid");
+        let Some(pid) = read_pid_file(&pid_path)? else {
+            if was_running {
+                anyhow::bail!(
+                    "daemon is reachable at [{}] but pid file is missing [{}]",
+                    self.addr,
+                    pid_path.display()
+                );
+            }
+            println!("daemon not running addr=[{}]", self.addr);
+            return Ok(());
+        };
+
+        if !was_running {
+            let _ = fs::remove_file(&pid_path);
+            println!("daemon not running addr=[{}]", self.addr);
+            return Ok(());
+        }
+
+        terminate_process(pid).await?;
+        wait_for_daemon_exit(self.addr, self.token()).await?;
+        let _ = fs::remove_file(&pid_path);
+        println!("daemon stopped addr=[{}] pid=[{}]", self.addr, pid);
+        Ok(())
+    }
+
+    async fn restart(&self, config: &Path) -> Result<()> {
+        let running_tasks = if probe_daemon(self.addr, self.token()).await.is_ok() {
+            daemon_list(self.addr, self.token())
+                .await?
+                .into_iter()
+                .filter(|task| task.pid.is_some())
+                .map(|task| task.name)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        self.stop().await?;
+        self.start(config).await?;
+
+        for task in running_tasks {
+            let info = daemon_task_action(self.addr, "task.start", &task, self.token()).await?;
+            print_task_result(&info);
+        }
+        Ok(())
+    }
+
+    async fn status(&self) -> Result<()> {
+        let pid_path = self.state_dir.join("rspmd.pid");
+        let pid = read_pid_file(&pid_path)?;
+        if probe_daemon(self.addr, self.token()).await.is_ok() {
+            println!(
+                "daemon: running addr=[{}] pid=[{}]",
+                self.addr,
+                pid.map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
+        } else {
+            println!(
+                "daemon: stopped addr=[{}] pid_file=[{}]",
+                self.addr,
+                if pid.is_some() { "stale" } else { "missing" }
+            );
+        }
+        Ok(())
+    }
+
     async fn ensure(&self, config: &Path) -> Result<SocketAddr> {
         if !self.auto_launch {
             return Ok(self.addr);
         }
-        if probe_daemon(self.addr).await.is_ok() {
+        if probe_daemon(self.addr, self.token()).await.is_ok() {
             return Ok(self.addr);
         }
         self.spawn(config)?;
-        wait_for_daemon(self.addr).await?;
+        wait_for_daemon(self.addr, self.token()).await?;
         Ok(self.addr)
     }
 
@@ -741,8 +1075,10 @@ impl DaemonLaunch {
             .with_context(|| format!("failed to open daemon stderr [{}]", stderr_path.display()))?;
 
         let exe = std::env::current_exe().context("failed to locate rspm executable")?;
-        let child = tokio::process::Command::new(exe)
+        let mut command = StdCommand::new(exe);
+        command
             .arg("daemon")
+            .arg("run")
             .arg(config)
             .arg(self.addr.to_string())
             .arg(&self.log_dir)
@@ -750,26 +1086,46 @@ impl DaemonLaunch {
             .arg(&self.socket_path)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
+            .stderr(Stdio::from(stderr));
+        if let Some(token) = &self.auth_token {
+            command.arg("--token").arg(token);
+        }
+        detach_daemon_command(&mut command);
+        let child = command
             .spawn()
             .context("failed to spawn rspmd through rspm daemon")?;
 
-        if let Some(pid) = child.id() {
-            fs::write(self.state_dir.join("rspmd.pid"), pid.to_string()).with_context(|| {
-                format!(
-                    "failed to write daemon pid file [{}]",
-                    self.state_dir.join("rspmd.pid").display()
-                )
-            })?;
-        }
+        fs::write(self.state_dir.join("rspmd.pid"), child.id().to_string()).with_context(|| {
+            format!(
+                "failed to write daemon pid file [{}]",
+                self.state_dir.join("rspmd.pid").display()
+            )
+        })?;
         Ok(())
     }
 }
 
-async fn wait_for_daemon(addr: SocketAddr) -> Result<()> {
+#[cfg(unix)]
+fn detach_daemon_command(command: &mut StdCommand) {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_daemon_command(_command: &mut StdCommand) {}
+
+async fn wait_for_daemon(addr: SocketAddr, token: Option<&str>) -> Result<()> {
     let mut last_error = None;
     for _ in 0..100 {
-        match probe_daemon(addr).await {
+        match probe_daemon(addr, token).await {
             Ok(_) => return Ok(()),
             Err(error) => last_error = Some(error),
         }
@@ -781,8 +1137,18 @@ async fn wait_for_daemon(addr: SocketAddr) -> Result<()> {
     anyhow::bail!("rspmd did not become ready at [{addr}]");
 }
 
-async fn probe_daemon(addr: SocketAddr) -> Result<()> {
-    let mut client = TcpRspmClient::connect(addr).await?;
+async fn wait_for_daemon_exit(addr: SocketAddr, token: Option<&str>) -> Result<()> {
+    for _ in 0..100 {
+        if probe_daemon(addr, token).await.is_err() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    anyhow::bail!("rspmd did not stop at [{addr}]");
+}
+
+async fn probe_daemon(addr: SocketAddr, token: Option<&str>) -> Result<()> {
+    let mut client = tcp_client(addr, token).await?;
     let response = client
         .send(RpcRequest::new(1, "task.list", serde_json::json!({})))
         .await?;
@@ -793,32 +1159,168 @@ async fn probe_daemon(addr: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-async fn daemon_list(addr: SocketAddr) -> Result<Vec<TaskInfo>> {
-    let mut client = TcpRspmClient::connect(addr).await?;
+fn read_pid_file(path: &Path) -> Result<Option<u32>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read daemon pid file [{}]", path.display()))?;
+    let pid = text
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("invalid daemon pid file [{}]", path.display()))?;
+    Ok(Some(pid))
+}
+
+async fn terminate_process(pid: u32) -> Result<()> {
+    if cfg!(target_os = "windows") {
+        let status = tokio::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .status()
+            .await
+            .context("failed to run taskkill")?;
+        if !status.success() {
+            anyhow::bail!("failed to stop daemon pid=[{}] with taskkill", pid);
+        }
+        return Ok(());
+    }
+
+    let status = tokio::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status()
+        .await
+        .context("failed to run kill")?;
+    if !status.success() {
+        anyhow::bail!("failed to stop daemon pid=[{}] with kill", pid);
+    }
+    Ok(())
+}
+
+async fn tcp_client(addr: SocketAddr, token: Option<&str>) -> Result<TcpRspmClient> {
+    let client = TcpRspmClient::connect(addr).await?;
+    Ok(match token {
+        Some(token) => client.with_token(token),
+        None => client,
+    })
+}
+
+async fn daemon_list(addr: SocketAddr, token: Option<&str>) -> Result<Vec<TaskInfo>> {
+    let mut client = tcp_client(addr, token).await?;
     let response = client
         .send(RpcRequest::new(1, "task.list", serde_json::json!({})))
         .await?;
+    if let Some(error) = response.error {
+        anyhow::bail!("rspmd error [{}]: {}", error.code, error.message);
+    }
     let result = response.result.context("rspmd returned no result")?;
     Ok(serde_json::from_value(result)?)
 }
 
-async fn follow_logs(addr: SocketAddr, task: &str) -> Result<()> {
-    let mut printed = 0;
-    loop {
-        let logs = daemon_task_logs(addr, task).await?;
-        if logs.len() < printed {
-            printed = 0;
+#[derive(Debug, Clone, Copy)]
+struct LogPrintOptions<'a> {
+    lines: Option<usize>,
+    grep: Option<&'a str>,
+    since: Option<DateTime<Utc>>,
+    merge: bool,
+}
+
+#[derive(Debug)]
+struct LogLine {
+    task: String,
+    line: String,
+    timestamp: Option<DateTime<Utc>>,
+    sequence: usize,
+}
+
+async fn print_task_logs(
+    addr: SocketAddr,
+    tasks: &[String],
+    options: LogPrintOptions<'_>,
+    token: Option<&str>,
+) -> Result<()> {
+    if options.merge {
+        let logs = read_task_logs(addr, tasks, token).await?;
+        print_merged_logs(&logs, options)?;
+        return Ok(());
+    }
+    for task in tasks {
+        let logs = daemon_task_logs(addr, task, token).await?;
+        print_prefixed_logs(task, &logs, options)?;
+    }
+    Ok(())
+}
+
+async fn read_task_logs(
+    addr: SocketAddr,
+    tasks: &[String],
+    token: Option<&str>,
+) -> Result<Vec<(String, String)>> {
+    let mut result = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        result.push((task.clone(), daemon_task_logs(addr, task, token).await?));
+    }
+    Ok(result)
+}
+
+fn initial_log_offsets(logs: &[(String, String)], include_history: bool) -> Vec<usize> {
+    if include_history {
+        vec![0; logs.len()]
+    } else {
+        logs.iter().map(|(_, log)| log.len()).collect()
+    }
+}
+
+async fn follow_logs(
+    addr: SocketAddr,
+    tasks: &[String],
+    include_history: bool,
+    options: LogPrintOptions<'_>,
+    token: Option<&str>,
+) -> Result<()> {
+    let initial_logs = read_task_logs(addr, tasks, token).await?;
+    let mut printed = initial_log_offsets(&initial_logs, include_history);
+    if include_history {
+        if options.merge {
+            print_merged_logs(&initial_logs, options)?;
+            for ((_, logs), printed_len) in initial_logs.iter().zip(printed.iter_mut()) {
+                *printed_len = logs.len();
+            }
+        } else {
+            for ((task, logs), printed_len) in initial_logs.iter().zip(printed.iter_mut()) {
+                if !logs.is_empty() {
+                    print_prefixed_logs(task, logs, options)?;
+                    *printed_len = logs.len();
+                }
+            }
         }
-        if logs.len() > printed {
-            print_prefixed_logs(task, &logs[printed..])?;
-            printed = logs.len();
+    }
+
+    loop {
+        let mut updated_logs = Vec::new();
+        for (index, task) in tasks.iter().enumerate() {
+            let logs = daemon_task_logs(addr, task, token).await?;
+            if logs.len() < printed[index] {
+                printed[index] = 0;
+            }
+            if logs.len() > printed[index] {
+                let updated = logs[printed[index]..].to_string();
+                if options.merge {
+                    updated_logs.push((task.clone(), updated));
+                } else {
+                    print_prefixed_logs(task, &updated, options)?;
+                }
+                printed[index] = logs.len();
+            }
+        }
+        if options.merge && !updated_logs.is_empty() {
+            print_merged_logs(&updated_logs, options)?;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
 
-fn print_prefixed_logs(task: &str, logs: &str) -> Result<()> {
-    for line in logs.split_inclusive('\n') {
+fn print_prefixed_logs(task: &str, logs: &str, options: LogPrintOptions<'_>) -> Result<()> {
+    for line in selected_log_lines(logs, options) {
         print!("{task} | {line}");
     }
     if !logs.is_empty() && !logs.ends_with('\n') {
@@ -828,8 +1330,88 @@ fn print_prefixed_logs(task: &str, logs: &str) -> Result<()> {
     Ok(())
 }
 
-async fn daemon_task_action(addr: SocketAddr, method: &str, task: &str) -> Result<TaskInfo> {
-    let mut client = TcpRspmClient::connect(addr).await?;
+fn print_merged_logs(logs: &[(String, String)], options: LogPrintOptions<'_>) -> Result<()> {
+    let mut lines = Vec::new();
+    let mut sequence = 0_usize;
+    for (task, log) in logs {
+        for line in selected_log_lines(log, options) {
+            lines.push(LogLine {
+                task: task.clone(),
+                timestamp: line_timestamp(&line),
+                line,
+                sequence,
+            });
+            sequence += 1;
+        }
+    }
+    lines.sort_by(|left, right| match (left.timestamp, right.timestamp) {
+        (Some(left_ts), Some(right_ts)) => left_ts
+            .cmp(&right_ts)
+            .then_with(|| left.sequence.cmp(&right.sequence)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.sequence.cmp(&right.sequence),
+    });
+    for line in lines {
+        print!("{} | {}", line.task, line.line);
+    }
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
+fn selected_log_lines(logs: &str, options: LogPrintOptions<'_>) -> Vec<String> {
+    let mut selected = logs
+        .split_inclusive('\n')
+        .filter(|line| options.grep.is_none_or(|grep| line.contains(grep)))
+        .filter(|line| {
+            options.since.is_none_or(|since| {
+                line_timestamp(line).is_some_and(|timestamp| timestamp >= since)
+            })
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if let Some(lines) = options.lines {
+        selected = selected
+            .into_iter()
+            .rev()
+            .take(lines)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+    }
+    selected
+}
+
+fn parse_since_timestamp(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    Ok(Some(
+        DateTime::parse_from_rfc3339(value)
+            .with_context(|| format!("invalid --since timestamp [{value}]"))?
+            .with_timezone(&Utc),
+    ))
+}
+
+fn line_timestamp(line: &str) -> Option<DateTime<Utc>> {
+    line.split_whitespace().find_map(|token| {
+        let token = token.trim_matches(|ch: char| {
+            !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | ':' | '.' | '+' | 'Z' | 'T'))
+        });
+        DateTime::parse_from_rfc3339(token)
+            .ok()
+            .map(|time| time.with_timezone(&Utc))
+    })
+}
+
+async fn daemon_task_action(
+    addr: SocketAddr,
+    method: &str,
+    task: &str,
+    token: Option<&str>,
+) -> Result<TaskInfo> {
+    let mut client = tcp_client(addr, token).await?;
     let response = client
         .send(RpcRequest::new(
             1,
@@ -844,8 +1426,8 @@ async fn daemon_task_action(addr: SocketAddr, method: &str, task: &str) -> Resul
     Ok(serde_json::from_value(result)?)
 }
 
-async fn daemon_task_logs(addr: SocketAddr, task: &str) -> Result<String> {
-    let mut client = TcpRspmClient::connect(addr).await?;
+async fn daemon_task_logs(addr: SocketAddr, task: &str, token: Option<&str>) -> Result<String> {
+    let mut client = tcp_client(addr, token).await?;
     let response = client
         .send(RpcRequest::new(
             1,
@@ -860,8 +1442,12 @@ async fn daemon_task_logs(addr: SocketAddr, task: &str) -> Result<String> {
     Ok(serde_json::from_value(result)?)
 }
 
-async fn daemon_all_action(addr: SocketAddr, method: &str) -> Result<Vec<TaskInfo>> {
-    let mut client = TcpRspmClient::connect(addr).await?;
+async fn daemon_all_action(
+    addr: SocketAddr,
+    method: &str,
+    token: Option<&str>,
+) -> Result<Vec<TaskInfo>> {
+    let mut client = tcp_client(addr, token).await?;
     let response = client
         .send(RpcRequest::new(1, method, serde_json::json!({})))
         .await?;
@@ -872,8 +1458,8 @@ async fn daemon_all_action(addr: SocketAddr, method: &str) -> Result<Vec<TaskInf
     Ok(serde_json::from_value(result)?)
 }
 
-async fn daemon_events(addr: SocketAddr) -> Result<Vec<TaskEvent>> {
-    let mut client = TcpRspmClient::connect(addr).await?;
+async fn daemon_events(addr: SocketAddr, token: Option<&str>) -> Result<Vec<TaskEvent>> {
+    let mut client = tcp_client(addr, token).await?;
     let response = client
         .send(RpcRequest::new(1, "event.list", serde_json::json!({})))
         .await?;
@@ -884,8 +1470,12 @@ async fn daemon_events(addr: SocketAddr) -> Result<Vec<TaskEvent>> {
     Ok(serde_json::from_value(result)?)
 }
 
-async fn daemon_apply(addr: SocketAddr, toml_text: &str) -> Result<Vec<TaskInfo>> {
-    let mut client = TcpRspmClient::connect(addr).await?;
+async fn daemon_apply(
+    addr: SocketAddr,
+    toml_text: &str,
+    token: Option<&str>,
+) -> Result<Vec<TaskInfo>> {
+    let mut client = tcp_client(addr, token).await?;
     let response = client
         .send(RpcRequest::new(
             1,
@@ -1008,6 +1598,10 @@ fn colored_cpu_cell(cpu: &str) -> String {
     }
 }
 
+fn format_cpu_percent(cpu_percent: f64) -> String {
+    format!("{cpu_percent:.1}%")
+}
+
 fn colored_memory_cell(memory_bytes: Option<u64>) -> String {
     let value = memory_bytes
         .map(format_bytes)
@@ -1089,6 +1683,17 @@ mod tests {
             "\x1b[33m512MB   \x1b[0m"
         );
     }
+
+    #[test]
+    fn follow_offsets_include_or_skip_history() {
+        let tasks = vec![
+            ("alpha".to_string(), "old-alpha\n".to_string()),
+            ("beta".to_string(), "old-beta\n".to_string()),
+        ];
+
+        assert_eq!(initial_log_offsets(&tasks, true), vec![0, 0]);
+        assert_eq!(initial_log_offsets(&tasks, false), vec![10, 9]);
+    }
 }
 
 fn format_duration(uptime_ms: u64) -> String {
@@ -1141,7 +1746,7 @@ fn service_template(config: &Path, addr: &str) -> String {
   <Actions Context="Author">
     <Exec>
       <Command>rspm.exe</Command>
-      <Arguments>daemon {config} {addr} .rspm/logs {state_dir}</Arguments>
+      <Arguments>daemon run {config} {addr} .rspm/logs {state_dir}</Arguments>
     </Exec>
   </Actions>
 </Task>
@@ -1159,6 +1764,7 @@ fn service_template(config: &Path, addr: &str) -> String {
   <array>
     <string>rspm</string>
     <string>daemon</string>
+    <string>run</string>
     <string>{config}</string>
     <string>{addr}</string>
     <string>.rspm/logs</string>
@@ -1175,7 +1781,7 @@ fn service_template(config: &Path, addr: &str) -> String {
 Description=rspm daemon
 
 [Service]
-ExecStart=rspm daemon {config} {addr} .rspm/logs {state_dir}
+ExecStart=rspm daemon run {config} {addr} .rspm/logs {state_dir}
 Restart=always
 
 [Install]
@@ -1242,6 +1848,45 @@ fn deactivation_commands() -> Vec<String> {
     ]
 }
 
+fn status_commands() -> Vec<String> {
+    if cfg!(target_os = "windows") {
+        return vec!["schtasks /Query /TN rspmd /V /FO LIST".to_string()];
+    } else if cfg!(target_os = "macos") {
+        return vec!["launchctl print gui/$(id -u)/rspmd".to_string()];
+    }
+    vec!["systemctl --user status rspmd.service".to_string()]
+}
+
+fn start_commands() -> Vec<String> {
+    if cfg!(target_os = "windows") {
+        return vec!["schtasks /Run /TN rspmd".to_string()];
+    } else if cfg!(target_os = "macos") {
+        return vec!["launchctl kickstart gui/$(id -u)/rspmd".to_string()];
+    }
+    vec!["systemctl --user start rspmd.service".to_string()]
+}
+
+fn stop_commands() -> Vec<String> {
+    if cfg!(target_os = "windows") {
+        return vec!["schtasks /End /TN rspmd".to_string()];
+    } else if cfg!(target_os = "macos") {
+        return vec!["launchctl kill TERM gui/$(id -u)/rspmd".to_string()];
+    }
+    vec!["systemctl --user stop rspmd.service".to_string()]
+}
+
+fn restart_commands() -> Vec<String> {
+    if cfg!(target_os = "windows") {
+        return vec![
+            "schtasks /End /TN rspmd".to_string(),
+            "schtasks /Run /TN rspmd".to_string(),
+        ];
+    } else if cfg!(target_os = "macos") {
+        return vec!["launchctl kickstart -k gui/$(id -u)/rspmd".to_string()];
+    }
+    vec!["systemctl --user restart rspmd.service".to_string()]
+}
+
 fn print_activation_commands(path: &Path) {
     for command in activation_commands(path) {
         println!("activation command: {command}");
@@ -1251,6 +1896,18 @@ fn print_activation_commands(path: &Path) {
 fn print_deactivation_commands() {
     for command in deactivation_commands() {
         println!("deactivation command: {command}");
+    }
+}
+
+fn print_status_commands() {
+    for command in status_commands() {
+        println!("status command: {command}");
+    }
+}
+
+fn print_service_commands(action: &str, commands: &[String]) {
+    for command in commands {
+        println!("{action} command: {command}");
     }
 }
 
@@ -1293,4 +1950,43 @@ fn cwd_writable() -> bool {
         }
         Err(_) => false,
     }
+}
+
+fn pid_file_state(path: &Path) -> &'static str {
+    match read_pid_file(path) {
+        Ok(Some(pid)) if process_exists(pid) => "ok",
+        Ok(Some(_)) => "stale",
+        Ok(None) => "missing",
+        Err(_) => "invalid",
+    }
+}
+
+fn event_log_state(path: &Path) -> &'static str {
+    if !path.exists() {
+        return "missing";
+    }
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.len() > 0 => "ok",
+        Ok(_) => "empty",
+        Err(_) => "unreadable",
+    }
+}
+
+fn process_exists(pid: u32) -> bool {
+    if cfg!(target_os = "windows") {
+        return StdCommand::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+            });
+    }
+
+    StdCommand::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }

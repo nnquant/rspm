@@ -60,6 +60,48 @@ async fn daemon_api_handles_start_describe_list_and_stop() {
 }
 
 #[tokio::test]
+async fn daemon_api_rejects_requests_with_missing_or_wrong_token() {
+    let temp = TempDir::new().expect("temp dir");
+    let config = ProjectConfig::from_toml_str(
+        r#"
+        [project]
+        name = "api-auth-test"
+
+        [tasks.echo]
+        cmd = "true"
+        "#,
+    )
+    .expect("valid config");
+    let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
+    let mut api = DaemonApi::new(runtime).with_auth_token("secret-token");
+
+    let missing = api
+        .handle(RpcRequest::new(1, "task.list", serde_json::json!({})))
+        .await
+        .expect("missing token response");
+    let wrong = api
+        .handle(RpcRequest::new(
+            2,
+            "task.list",
+            serde_json::json!({ "token": "wrong-token" }),
+        ))
+        .await
+        .expect("wrong token response");
+    let accepted = api
+        .handle(RpcRequest::new(
+            3,
+            "task.list",
+            serde_json::json!({ "token": "secret-token" }),
+        ))
+        .await
+        .expect("accepted response");
+
+    assert_eq!(missing.error.expect("error").code, -32001);
+    assert_eq!(wrong.error.expect("error").code, -32001);
+    assert!(accepted.error.is_none());
+}
+
+#[tokio::test]
 async fn daemon_api_starts_and_stops_all_tasks_in_dag_order() {
     let temp = TempDir::new().expect("temp dir");
     let config = ProjectConfig::from_toml_str(
@@ -393,6 +435,74 @@ async fn daemon_api_writes_lifecycle_events_to_jsonl_log() {
     let events = std::fs::read_to_string(event_path).expect("event log");
     assert!(events.contains("task_started"));
     assert!(events.contains("task_stopped"));
+}
+
+#[tokio::test]
+async fn runtime_restores_lifecycle_state_from_event_log() {
+    let temp = TempDir::new().expect("temp dir");
+    let event_path = temp.path().join("events").join("project.jsonl");
+    let config = ProjectConfig::from_toml_str(
+        r#"
+        [project]
+        name = "event-restore-test"
+
+        [tasks.echo]
+        cmd = "sh"
+        args = ["-c", "printf restore"]
+        "#,
+    )
+    .expect("valid config");
+    let mut runtime = TaskRuntime::new(config.clone(), temp.path())
+        .expect("runtime")
+        .with_event_log_path(&event_path);
+
+    runtime.start_task("echo").await.expect("start");
+    let stopped = runtime.wait_task_exit("echo").await.expect("wait");
+    assert!(stopped.started_at.is_some());
+    assert!(stopped.stopped_at.is_some());
+
+    let restored = TaskRuntime::new(config, temp.path())
+        .expect("runtime")
+        .with_event_log_path(&event_path);
+    let info = restored.describe_task("echo").expect("describe");
+
+    assert!(info.started_at.is_some());
+    assert!(info.stopped_at.is_some());
+    assert!(info.uptime_ms.is_some());
+    assert!(!restored.list_events().is_empty());
+}
+
+#[tokio::test]
+async fn runtime_reattaches_running_task_pid_from_event_log() {
+    let temp = TempDir::new().expect("temp dir");
+    let event_path = temp.path().join("events").join("project.jsonl");
+    let config = ProjectConfig::from_toml_str(
+        r#"
+        [project]
+        name = "reattach-test"
+
+        [tasks.sleeper]
+        cmd = "sh"
+        args = ["-c", "sleep 30"]
+        "#,
+    )
+    .expect("valid config");
+    let mut runtime = TaskRuntime::new(config.clone(), temp.path())
+        .expect("runtime")
+        .with_event_log_path(&event_path);
+    let started = runtime.start_task("sleeper").await.expect("start");
+    let started_pid = started.pid.expect("pid");
+    drop(runtime);
+
+    let mut restored = TaskRuntime::new(config, temp.path())
+        .expect("runtime")
+        .with_event_log_path(&event_path);
+    let info = restored.describe_task("sleeper").expect("describe");
+
+    assert_eq!(info.pid, Some(started_pid));
+    assert_eq!(info.status, rspm_core::state::TaskStatus::Online);
+
+    restored.stop_task("sleeper").await.expect("cleanup");
 }
 
 #[tokio::test]
