@@ -1040,6 +1040,7 @@ impl DaemonLaunch {
     }
 
     fn spawn(&self, config: &Path) -> Result<()> {
+        self.ensure_config_source(config)?;
         fs::create_dir_all(&self.log_dir).with_context(|| {
             format!(
                 "failed to create daemon log directory [{}]",
@@ -1102,6 +1103,18 @@ impl DaemonLaunch {
             )
         })?;
         Ok(())
+    }
+
+    fn ensure_config_source(&self, config: &Path) -> Result<()> {
+        let applied_config = self.state_dir.join("applied.toml");
+        if config.exists() || applied_config.exists() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "missing config [{}] and no applied config [{}]; run `rspm apply -f <file>` or pass `-f <file>`",
+            config.display(),
+            applied_config.display()
+        );
     }
 }
 

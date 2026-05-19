@@ -222,6 +222,37 @@ async fn cli_status_starts_daemon_when_it_is_not_running() {
 }
 
 #[tokio::test]
+async fn cli_reports_missing_config_before_spawning_daemon() {
+    let temp = TempDir::new().expect("temp dir");
+    let config_path = temp.path().join("missing.toml");
+    let log_dir = temp.path().join("logs");
+    let state_dir = temp.path().join("state");
+    let socket_path = temp.path().join("run").join("rspmd.sock");
+    let address = free_tcp_addr();
+
+    let output = run_cli(&[
+        "--addr",
+        &address.to_string(),
+        "--log-dir",
+        &log_dir.display().to_string(),
+        "--state-dir",
+        &state_dir.display().to_string(),
+        "--socket-path",
+        &socket_path.display().to_string(),
+        "ls",
+        "-f",
+        &config_path.display().to_string(),
+    ])
+    .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("missing config"));
+    assert!(stderr.contains("apply -f"));
+    assert!(!state_dir.join("rspmd.pid").exists());
+}
+
+#[tokio::test]
 async fn cli_monit_once_prints_monitor_snapshot() {
     let temp = TempDir::new().expect("temp dir");
     let config_path = temp.path().join("rspm.toml");
