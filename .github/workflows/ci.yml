@@ -60,18 +60,8 @@ jobs:
           cargo test -p rspm-sdk --test transport_tests named_pipe_sdk_client_sends_request_to_daemon_transport
 
   platform-smoke:
-    name: platform-smoke-${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            shell: bash
-            command: scripts/smoke-posix.sh
-          - os: windows-latest
-            shell: pwsh
-            command: .\scripts\smoke-windows.ps1
+    name: platform-smoke-macos
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -82,8 +72,23 @@ jobs:
           python-version: "3.x"
 
       - name: smoke
-        shell: ${{ matrix.shell }}
-        run: ${{ matrix.command }}
+        run: scripts/smoke-posix.sh
+
+  windows-smoke:
+    name: platform-smoke-windows
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: smoke
+        shell: pwsh
+        run: .\scripts\smoke-windows.ps1
 
   python:
     name: python-sdk
