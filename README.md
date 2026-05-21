@@ -1,5 +1,9 @@
 # rspm
 
+[![ci](https://github.com/nnquant/rspm/actions/workflows/ci.yml/badge.svg)](https://github.com/nnquant/rspm/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![version](https://img.shields.io/badge/version-0.1.0-informational.svg)](Cargo.toml)
+
 `rspm` is a local-first process manager for deterministic task orchestration.
 It is written in Rust, configured with TOML, and designed for research
 workstations, trading infrastructure, local service stacks, and other systems
