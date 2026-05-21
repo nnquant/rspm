@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use rspm_core::config::{BackoffMode, ProjectConfig, ReloadMode, RestartPolicy};
+use rspm_core::display::format_display_table_time;
 use rspm_core::event::{EventType, TaskEvent};
 use rspm_core::schedule::{next_scheduled_action, ScheduledAction, ScheduledActionKind};
 use rspm_core::state::{TaskInfo, TaskStatus};
@@ -563,6 +564,7 @@ impl TaskRuntime {
                 dependencies: task.depends_on.clone(),
                 dependents,
                 schedule_state: self.next_schedule_state(task_name, now)?,
+                display_timezone: Some(self.display_timezone().to_string()),
             });
         }
         if let Some(pid) = self.restored_pids.get(task_name).copied() {
@@ -604,6 +606,7 @@ impl TaskRuntime {
                     dependencies: task.depends_on.clone(),
                     dependents,
                     schedule_state: self.next_schedule_state(task_name, now)?,
+                    display_timezone: Some(self.display_timezone().to_string()),
                 });
             }
         }
@@ -676,11 +679,17 @@ impl TaskRuntime {
             dependencies: task.depends_on.clone(),
             dependents: self.dependents(task_name),
             schedule_state: self.next_schedule_state(task_name, now)?,
+            display_timezone: Some(self.display_timezone().to_string()),
         })
     }
 
     fn next_schedule_state(&self, task_name: &str, now: DateTime<Utc>) -> Result<Option<String>> {
-        Ok(next_scheduled_action(&self.config, task_name, now)?.map(format_next_action))
+        Ok(next_scheduled_action(&self.config, task_name, now)?
+            .map(|action| format_next_action(action, self.display_timezone())))
+    }
+
+    fn display_timezone(&self) -> &str {
+        &self.config.project.display_timezone
     }
 
     fn record_task_stop(&mut self, task_name: &str, managed: &ManagedTask, exit_code: Option<i32>) {
@@ -1133,7 +1142,7 @@ fn rotate_log_if_needed(
     Ok(())
 }
 
-fn format_next_action(action: ScheduledAction) -> String {
+fn format_next_action(action: ScheduledAction, display_timezone: &str) -> String {
     let action_label = match action.kind {
         ScheduledActionKind::Start => "start",
         ScheduledActionKind::Stop => "stop",
@@ -1144,7 +1153,7 @@ fn format_next_action(action: ScheduledAction) -> String {
     format!(
         "{} {}",
         action_label,
-        action.due_at.format("%m-%d %H:%M:%SZ")
+        format_display_table_time(&action.due_at, Some(display_timezone))
     )
 }
 

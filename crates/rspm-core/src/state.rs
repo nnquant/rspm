@@ -40,4 +40,6 @@ pub struct TaskInfo {
     pub dependencies: Vec<String>,
     pub dependents: Vec<String>,
     pub schedule_state: Option<String>,
+    #[serde(default)]
+    pub display_timezone: Option<String>,
 }

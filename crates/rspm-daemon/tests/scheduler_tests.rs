@@ -46,7 +46,8 @@ async fn task_info_reports_next_scheduled_action() {
         r#"
         [project]
         name = "next-info-test"
-        timezone = "Asia/Shanghai"
+        timezone = "UTC"
+        display_timezone = "Asia/Shanghai"
 
         [tasks.market]
         cmd = "true"
@@ -65,10 +66,8 @@ async fn task_info_reports_next_scheduled_action() {
         )
         .expect("task info");
 
-    assert_eq!(
-        info.schedule_state.as_deref(),
-        Some("start 05-18 00:30:00Z")
-    );
+    assert_eq!(info.schedule_state.as_deref(), Some("start 05-18 16:30:00"));
+    assert_eq!(info.display_timezone.as_deref(), Some("Asia/Shanghai"));
 }
 
 #[tokio::test]

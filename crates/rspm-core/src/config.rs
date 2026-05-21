@@ -4,6 +4,7 @@ use std::str::FromStr;
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
 
+use crate::display::{is_valid_display_timezone, DEFAULT_DISPLAY_TIMEZONE};
 use crate::error::ConfigError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +36,12 @@ impl ProjectConfig {
                 "at least one [tasks.<name>] section is required".to_string(),
             ));
         }
+        if !is_valid_display_timezone(&self.project.display_timezone) {
+            return Err(ConfigError::Validation(format!(
+                "invalid project display_timezone [{}]",
+                self.project.display_timezone
+            )));
+        }
 
         for (task_name, task) in &self.tasks {
             if let Some(schedule) = &task.schedule {
@@ -60,6 +67,8 @@ pub struct ProjectSection {
     pub name: String,
     #[serde(default = "default_timezone")]
     pub timezone: String,
+    #[serde(default = "default_display_timezone")]
+    pub display_timezone: String,
 }
 
 impl Default for ProjectSection {
@@ -67,6 +76,7 @@ impl Default for ProjectSection {
         Self {
             name: "default".to_string(),
             timezone: default_timezone(),
+            display_timezone: default_display_timezone(),
         }
     }
 }
@@ -242,6 +252,10 @@ impl Default for StartWhen {
 
 fn default_timezone() -> String {
     "UTC".to_string()
+}
+
+fn default_display_timezone() -> String {
+    DEFAULT_DISPLAY_TIMEZONE.to_string()
 }
 
 pub fn normalize_cron_expr(expr: &str) -> String {

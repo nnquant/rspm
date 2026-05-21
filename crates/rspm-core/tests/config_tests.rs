@@ -68,6 +68,7 @@ fn parses_project_defaults_tasks_health_schedule_and_cron() {
 
     assert_eq!(config.project.name, "trading-stack");
     assert_eq!(config.project.timezone, "Asia/Shanghai");
+    assert_eq!(config.project.display_timezone, "local");
     assert_eq!(config.defaults.restart, RestartPolicy::OnFailure);
     assert_eq!(config.defaults.restart_delay.as_deref(), Some("3s"));
     assert_eq!(config.defaults.backoff, BackoffMode::Exponential);
@@ -133,6 +134,7 @@ fn applies_documented_defaults_when_task_fields_are_absent() {
     .expect("valid config");
 
     assert_eq!(config.project.timezone, "UTC");
+    assert_eq!(config.project.display_timezone, "local");
     assert_eq!(config.defaults.restart, RestartPolicy::Never);
     assert_eq!(config.defaults.backoff, BackoffMode::None);
 
@@ -141,6 +143,40 @@ fn applies_documented_defaults_when_task_fields_are_absent() {
     assert_eq!(worker.start_when, StartWhen::DependenciesHealthy);
     assert!(worker.args.is_empty());
     assert!(worker.depends_on.is_empty());
+}
+
+#[test]
+fn parses_project_display_timezone_override() {
+    let config = ProjectConfig::from_toml_str(
+        r#"
+        [project]
+        name = "display-timezone"
+        display_timezone = "Asia/Shanghai"
+
+        [tasks.worker]
+        cmd = "true"
+        "#,
+    )
+    .expect("valid config");
+
+    assert_eq!(config.project.display_timezone, "Asia/Shanghai");
+}
+
+#[test]
+fn rejects_invalid_project_display_timezone() {
+    let error = ProjectConfig::from_toml_str(
+        r#"
+        [project]
+        name = "bad-display-timezone"
+        display_timezone = "Mars/Base"
+
+        [tasks.worker]
+        cmd = "true"
+        "#,
+    )
+    .expect_err("invalid display timezone");
+
+    assert!(error.to_string().contains("display_timezone"));
 }
 
 #[test]

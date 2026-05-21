@@ -1,6 +1,7 @@
 [project]
 name = "trading-stack"
 timezone = "Asia/Shanghai"
+display_timezone = "local"
 
 [defaults]
 restart = "on-failure"

@@ -161,6 +161,7 @@ CLI 和 SDK 使用同一套本地 RPC API。
 [project]
 name = "trading-stack"
 timezone = "Asia/Shanghai"
+display_timezone = "local"
 
 [defaults]
 restart = "on-failure"
@@ -385,9 +386,10 @@ action = "restart"
 时间语义：
 
 1. 所有 cron 表达式按 `[project].timezone` 解释。
-2. 如果系统休眠错过触发时间，第一版默认不补跑。
-3. daemon 重启后重新计算下一次触发时间。
-4. schedule 触发的 start 仍需遵守 DAG 依赖。
+2. CLI 表格时间按 `[project].display_timezone` 格式化，默认 `local`；表格行内不展示 offset，表格后输出 `Timezone: ...` 附注。
+3. 如果系统休眠错过触发时间，第一版默认不补跑。
+4. daemon 重启后重新计算下一次触发时间。
+5. schedule 触发的 start 仍需遵守 DAG 依赖。
 
 ## 14. 日志
 
