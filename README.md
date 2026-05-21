@@ -1,92 +1,252 @@
 # rspm
 
-`rspm` is a Rust task process manager designed as a deterministic, TOML-based alternative to PM2.
-It focuses on local process supervision, DAG startup order, health checks, scheduling, structured
-events, and SDK-driven automation.
+`rspm` is a local-first process manager for deterministic task orchestration.
+It is written in Rust, configured with TOML, and designed for research
+workstations, trading infrastructure, local service stacks, and other systems
+where process state must be explicit, auditable, and scriptable.
 
-## Current Workspace
+`rspm` keeps the day-to-day ergonomics of tools such as PM2 while avoiding a
+Node.js-specific runtime model. Tasks are language-agnostic child processes,
+configuration is declarative, startup order is modeled as a DAG, and the same
+daemon control plane is available through the CLI, Rust SDK, and Python SDK.
 
-```text
-crates/rspm-core     configuration, state, DAG, schedule, events, RPC payloads
-crates/rspm-daemon   process runtime, health checks, orchestration, scheduler, daemon API, TCP/Unix server
-crates/rspm-sdk      Rust SDK, in-process client, TCP fallback client, Unix socket client
-crates/rspm          CLI package and daemon bootstrap entrypoint
-python/rspm          Python SDK
-```
+## Highlights
 
-## CLI
+- **Declarative TOML**: define projects, tasks, defaults, schedules, probes,
+  restart policies, environment variables, and log retention in one file.
+- **Task DAGs**: start dependencies first, wait for health when configured, and
+  stop dependents before upstream services.
+- **Real process supervision**: handle start, stop, restart, reload, crash
+  recovery, restart backoff, watch restarts, memory restarts, and log capture.
+- **Local daemon control plane**: operate through `rspmd` over Unix sockets,
+  Windows named pipes, or local TCP fallback.
+- **Operator-friendly CLI**: validate configs, apply projects, inspect status,
+  stream logs, view events, run doctor checks, and bootstrap the daemon from one
+  command surface.
+- **Rust and Python SDKs**: embed `rspm` behind host-facing tools without making
+  users manage the daemon manually.
+- **Cross-platform focus**: Linux, macOS, and Windows are covered by CI smoke
+  tests and platform-specific transport checks.
 
-Validate a config:
+## Status
+
+`rspm` is an early `0.1.x` project, but the core workflow is already usable:
+
+- config parsing and validation
+- DAG planning and execution order
+- daemon-backed task lifecycle controls
+- restart policies, health probes, schedules, and cron actions
+- structured task state and event records
+- CLI table/log/event rendering
+- Rust SDK and Python SDK clients
+- detached sidecar supervisor for host integration
+- CI, release artifact workflow, and local smoke scripts
+
+See [docs/design.md](docs/design.md) for the full design rationale and
+[docs/validation.md](docs/validation.md) for the validation matrix.
+
+## Install
+
+Install the CLI from this repository:
 
 ```bash
-cargo run -p rspm -- validate -f examples/rspm.toml
+cargo install --path crates/rspm --locked
 ```
 
-Dry-run apply and inspect the DAG plan:
+If your dependency cache is already warm and the network is unavailable:
 
 ```bash
-cargo run -p rspm -- apply -f examples/rspm.toml --dry-run
+cargo install --path crates/rspm --locked --offline
 ```
 
-Print the dependency graph:
+During development, run the CLI directly from the workspace:
 
 ```bash
-cargo run -p rspm -- graph -f examples/rspm.toml
+cargo run -p rspm -- --help
 ```
 
-List tasks in a daemon-backed table. If the local daemon is not running, `rspm` starts it:
+The Python SDK lives in `python/` and uses `uv` for local development:
 
 ```bash
-cargo run -p rspm -- ls -f examples/rspm.toml
+cd python
+uv run python -m pytest -q
 ```
 
-Apply and operate tasks without starting `rspmd` manually:
+## Quick Start
+
+Validate the example project:
 
 ```bash
-cargo run -p rspm -- apply -f examples/rspm.toml
-cargo run -p rspm -- start all
+cargo run -p rspm -- validate -f examples/tasks.rspm.toml
+```
+
+Apply it. Daemon-backed commands automatically start a local `rspmd` sidecar
+when one is not already reachable.
+
+```bash
+cargo run -p rspm -- apply -f examples/tasks.rspm.toml
+```
+
+Inspect tasks:
+
+```bash
 cargo run -p rspm -- ls
-cargo run -p rspm -- start 1 2 3
-cargo run -p rspm -- describe master
-cargo run -p rspm -- log
-cargo run -p rspm -- log --no-history
-cargo run -p rspm -- log 1
-cargo run -p rspm -- log 1 --no-follow
-cargo run -p rspm -- logs
-cargo run -p rspm -- logs master
-cargo run -p rspm -- logs master --lines 100
-cargo run -p rspm -- logs --grep ERROR
-cargo run -p rspm -- logs --since 2026-05-19T09:30:00Z
-cargo run -p rspm -- logs --merge
-cargo run -p rspm -- logs master -f
-cargo run -p rspm -- logs all -f --no-history
+cargo run -p rspm -- status
+cargo run -p rspm -- describe long_watcher
+```
+
+Start tasks by name or stable task id:
+
+```bash
+cargo run -p rspm -- start long_watcher
+cargo run -p rspm -- start 1 3
+```
+
+Read logs and events:
+
+```bash
+cargo run -p rspm -- log all --no-follow --lines 20 --merge
+cargo run -p rspm -- logs long_watcher -f
 cargo run -p rspm -- events
-cargo run -p rspm -- doctor
-cargo run -p rspm -- monit --once
-cargo run -p rspm -- daemon status -f examples/rspm.toml
-cargo run -p rspm -- daemon restart -f examples/rspm.toml
-RSPM_TOKEN=local-secret cargo run -p rspm -- --token local-secret ls
+```
+
+Stop managed tasks and the daemon:
+
+```bash
+cargo run -p rspm -- stop all
+cargo run -p rspm -- daemon stop
+```
+
+For an end-to-end smoke procedure, run:
+
+```bash
+scripts/smoke-posix.sh
+```
+
+On Windows PowerShell:
+
+```powershell
+.\scripts\smoke-windows.ps1
+```
+
+## Configuration
+
+A project is a TOML file with a `[project]` section, optional `[defaults]`, and
+one or more `[tasks.<name>]` entries.
+
+```toml
+[project]
+name = "trading-stack"
+timezone = "Asia/Shanghai"
+display_timezone = "local"
+
+[defaults]
+restart = "on-failure"
+restart_delay = "3s"
+max_restarts = 10
+kill_timeout = "10s"
+
+[tasks.master]
+cmd = "uv"
+args = ["run", "ldc-master"]
+cwd = "/srv/trading"
+autostart = true
+restart = "always"
+
+[tasks.master.health]
+type = "tcp"
+address = "127.0.0.1:17690"
+interval = "1s"
+timeout = "500ms"
+success_after = 2
+failure_after = 3
+
+[tasks.gateway]
+cmd = "uv"
+args = ["run", "ldc-ctp-md"]
+cwd = "/srv/trading"
+depends_on = ["master"]
+start_when = "dependencies_healthy"
+restart = "on-failure"
+
+[tasks.gateway.schedule]
+start = "0 8 * * 1-5"
+stop = "0 16 * * 1-5"
+```
+
+Important configuration rules:
+
+- TOML is the source of truth; runtime state does not silently rewrite declared
+  task definitions.
+- Task names are the stable logical identifiers.
+- Timezone-sensitive scheduling uses explicit project timezones.
+- A five-field cron expression is normalized with a zero seconds field; six-field
+  expressions are also supported.
+- Health checks can gate dependent startup when `start_when =
+  "dependencies_healthy"` is set.
+
+## CLI Reference
+
+Common commands:
+
+```bash
+rspm validate -f examples/tasks.rspm.toml
+rspm apply -f examples/tasks.rspm.toml --dry-run
+rspm graph -f examples/tasks.rspm.toml
+rspm apply -f examples/tasks.rspm.toml
+rspm ls
+rspm monit --once
+rspm start all
+rspm stop all
+rspm restart long_watcher
+rspm reload gateway
+rspm describe gateway
+rspm logs gateway --lines 100
+rspm logs all --grep ERROR --merge
+rspm events
+rspm doctor
+rspm daemon status -f examples/tasks.rspm.toml
+```
+
+Use `--no-daemon` for local config editing or validation flows that should not
+auto-start a sidecar:
+
+```bash
+rspm --no-daemon add --name worker --cwd /srv/app --env RUST_LOG=info "uv run worker.py"
+```
+
+Use `RSPM_TOKEN` or `--token` when a daemon is started with local control-plane
+authentication:
+
+```bash
+RSPM_TOKEN=local-secret rspm --token local-secret ls
 ```
 
 ## Rust SDK
 
+Use `RspmSupervisor` when embedding `rspm` in another Rust application. The host
+owns the sidecar daemon lifecycle; `rspmd` owns managed task lifecycles.
+
 ```rust
-use rspm_core::config::ProjectConfig;
-use rspm_daemon::runtime::TaskRuntime;
-use rspm_sdk::RspmClient;
+use rspm_sdk::RspmSupervisor;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = ProjectConfig::from_toml_str(std::fs::read_to_string("examples/rspm.toml")?.as_str())?;
-    let runtime = TaskRuntime::new(config, ".rspm/logs")?;
-    let mut client = RspmClient::from_runtime(runtime);
+    let mut client = RspmSupervisor::new()
+        .state_dir(".myapp/rspm/state")
+        .log_dir(".myapp/rspm/logs")
+        .socket_path(".myapp/rspm/run/rspmd.sock")
+        .ensure_daemon("examples/tasks.rspm.toml")
+        .await?;
 
-    client.start("master").await?;
-    client.wait_healthy("master", std::time::Duration::from_secs(30)).await?;
+    client.apply_file("examples/tasks.rspm.toml").await?;
+    client.start("long_watcher").await?;
+    client
+        .wait_healthy("long_watcher", std::time::Duration::from_secs(30))
+        .await?;
+
     let tasks = client.list_tasks().await?;
-    let logs = client.logs_all().await?;
-    println!("{tasks:#?}");
-    println!("{logs:#?}");
+    print!("{}", rspm_sdk::render::format_task_table(&tasks));
 
     Ok(())
 }
@@ -94,147 +254,113 @@ async fn main() -> anyhow::Result<()> {
 
 ## Python SDK
 
-```python
-from rspm import RspmClient
+The Python package exposes sync and async clients plus the same detached sidecar
+supervisor model.
 
-client = RspmClient.connect_tcp("127.0.0.1", 27691)
-# Optional when rspmd is started with an auth token.
-# client = client.with_token("local-secret")
-task = client.start("master")
-client.wait_healthy("master", timeout=30)
-logs = client.logs_all()
-print(task.name, task.status, task.pid)
-print(logs)
+```python
+from rspm import RspmSupervisor
+from rspm.render import format_task_table
+
+client = RspmSupervisor(
+    state_dir=".myapp/rspm/state",
+    log_dir=".myapp/rspm/logs",
+    socket_path=".myapp/rspm/run/rspmd.sock",
+).ensure_daemon("examples/tasks.rspm.toml")
+
+client.apply_file("examples/tasks.rspm.toml")
+client.start("long_watcher")
+client.wait_healthy("long_watcher", timeout=30)
+
+print(format_task_table(client.list_tasks()), end="")
 ```
 
-Async:
+Async TCP fallback:
 
 ```python
 from rspm.aio import AsyncRspmClient
 
 async with AsyncRspmClient.connect_tcp("127.0.0.1", 27691) as client:
-    # Optional when rspmd is started with an auth token.
-    # client = client.with_token("local-secret")
-    task = await client.start("strategy")
-    logs = await client.logs_all()
+    task = await client.start("long_watcher")
     print(task.name, task.status)
-    print(logs)
 ```
 
-## Verification
+## Architecture
+
+```text
+rspm.toml
+   |
+   v
+rspm-core     config, DAG, schedule, state, event, RPC types
+   |
+   v
+rspm-daemon   runtime supervision, health, logs, scheduler, RPC server
+   |
+   +--> rspm CLI
+   +--> rspm-sdk Rust client and supervisor
+   +--> python/rspm sync and async clients
+```
+
+Workspace layout:
+
+```text
+crates/rspm-core     shared config, state, scheduling, DAG, and API types
+crates/rspm-daemon   daemon runtime and local transports
+crates/rspm-sdk      Rust client, supervisor, transport, and render helpers
+crates/rspm          CLI and daemon bootstrap entrypoint
+python/rspm          Python SDK
+docs/                design notes, validation matrix, and completion audit
+examples/            runnable example projects and smoke-task scripts
+```
+
+## Development
+
+Required tools:
+
+- Rust stable toolchain
+- Python 3.10+
+- [`uv`](https://docs.astral.sh/uv/) for Python package and virtual environment
+  management
+
+Run the main verification gates:
 
 ```bash
+cargo fmt --all -- --check
 cargo test --workspace
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace --target x86_64-pc-windows-gnu
 cd python && uv run python -m pytest -q
 ```
 
-See `docs/validation.md`, `docs/completion-audit.md`, and `examples/README.md` for the
-cross-platform gate matrix, requirement audit, and daemon-backed example smoke procedure.
+Release tags matching `v*` build Linux, macOS, and Windows binaries through
+[.github/workflows/release.yml](.github/workflows/release.yml).
 
-## Local Install
+## Contributing
 
-Install the CLI from this workspace:
+Issues and pull requests are welcome. For changes that affect runtime behavior,
+configuration semantics, daemon transports, SDK contracts, or CLI output, include
+tests that exercise the real boundary rather than only mocking the call site.
 
-```bash
-cargo install --path crates/rspm --locked
-```
-
-If the dependency index is already cached and the network is unavailable, use:
+Before opening a pull request:
 
 ```bash
-cargo install --path crates/rspm --locked --offline
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cd python && uv run python -m pytest -q
 ```
 
-After installation, use `rspm` directly instead of `cargo run -p rspm --`:
+Please keep public APIs explicit and deterministic. Timezones, paths, restart
+rules, and health semantics should be visible in configuration or SDK calls.
 
-```bash
-rspm apply -f examples/tasks.rspm.toml
-rspm ls
-rspm log all --no-follow --lines 20 --merge
-```
+## Security
 
-## Design Status
+`rspm` is a local process manager. Treat config files as privileged inputs: they
+define executable commands and environment variables. Do not commit secrets in
+TOML files, logs, examples, or CI configuration.
 
-Implemented:
+When exposing a daemon beyond the default local transports, use token
+authentication and bind only to trusted interfaces.
 
-- TOML config parsing and validation.
-- Static rejection of empty/non-task configs.
-- 5-field and 6-field cron parsing.
-- Cron expressions interpreted through the project timezone for UTC, Asia/Shanghai, and fixed
-  UTC/GMT offsets.
-- DAG validation and start/stop ordering.
-- Task state and event payloads.
-- Real process spawn, stop, restart, log capture, configured log rotation, and status reporting.
-- Crash restart for `always` and `on-failure` policies, including restart delay, exponential
-  backoff, max backoff, and max restart limits.
-- Watch restart using deterministic file mtime reconciliation.
-- Memory restart using configured byte limits and process RSS sampling on Linux.
-- Command, file, TCP, and minimal HTTP health checks.
-- DAG start orchestration with health gating and healthy/unhealthy task status updates.
-- Schedule and cron due-action collection plus daemon tick execution for start, stop, restart,
-  reload, and one-shot command actions.
-- Daemon startup compensation for tasks whose schedule start/stop window is already active,
-  including DAG dependency startup.
-- `rspmd` background maintenance loop for scheduled actions, restart reconciliation, watch restart,
-  memory restart, and health checks.
-- Applied config persistence under the configured state directory. On restart, `rspmd` prefers the
-  previously applied config and starts autostart tasks from that declared config.
-- JSONL event persistence when an event log path is configured. Runtime startup restores lifecycle
-  state from the event log and reattaches still-running task PIDs for describe/stop/restart flows.
-- JSON-RPC-style request/response payloads.
-- Optional local control-plane token authentication. When a daemon is started with a token, CLI and
-  SDK requests must include the same token through `--token`, `RSPM_TOKEN`, or SDK `with_token`.
-- Daemon API handler for task start, stop, restart, wait, logs, events, describe, list, start_all,
-  stop_all, reload, and config.apply.
-- Reload via configured command or Unix signal, with explicit errors for unconfigured reload.
-- TCP JSON-line fallback daemon transport, Unix socket daemon transport on Unix platforms, and
-  Windows named-pipe transport behind `cfg(windows)`.
-- Rust SDK in-process client, TCP fallback client, Unix socket client on Unix platforms, and
-  Windows named-pipe client behind `cfg(windows)`.
-- Python SDK request builders plus sync/async TCP fallback clients, aggregate log helpers, and
-  structured `TaskInfo` results for daemon-backed calls.
-- CLI validate, apply, graph text/dot/json, ls, status, monit, describe, start, stop, restart, reload,
-  logs with follow mode, events, doctor, daemon start/stop/restart/status, and service
-  install/uninstall/start/stop/restart/status commands. `ls` exposes a stable `TASK_ID` for the current applied project, and
-  `start`/`stop`/`restart` accept multiple task names or IDs. Control commands print a fresh task
-  table after execution. `log`/`logs` accept task names, IDs, `all`, or no task for aggregate
-  output. They prefix each line with `task_name | ` and preserve ANSI terminal styling from task
-  output. `log` follows by default; use `--no-follow` for a one-shot view. Follow mode prints
-  existing history first by default; use `--no-history` to show only newly appended log lines.
-  `--lines N` tails each selected task log and `--grep TEXT` filters matching log lines before
-  prefixing. `--since RFC3339` keeps timestamped lines at or after the given instant and drops
-  untimestamped lines for that query. `--merge` orders aggregate output by RFC3339 timestamps when
-  log lines contain them, while preserving task-local order for lines without parseable timestamps.
-- CLI-managed daemon bootstrap: daemon-backed commands start `rspm daemon` automatically when the
-  local control plane is not already reachable. `rspm daemon stop` first stops managed tasks through
-  the daemon API, then stops the daemon process recorded in the configured state directory.
-- Daemon bootstrap detaches the background process on Unix and starts the control transport before
-  running autostart/scheduled startup tasks, so slow task health checks do not make the daemon look
-  unreachable during CLI startup.
-- `rspm doctor` reports daemon reachability plus config, log directory, state directory, pid-file,
-  applied config, event-log, socket path, cwd write permission, and task-count diagnostics.
-- `rspm monit` refreshes the task monitor table; `rspm monit --once` prints a script-friendly
-  monitor snapshot and exits.
+## License
 
-Operational notes:
-
-- `rspm service install` writes platform service templates to the default user-service path or an
-  explicit `--output` path. With `--dry-run --activate`, it prints platform activation commands;
-  with `--activate` in normal mode, it executes those commands.
-- `rspm service status --dry-run` prints the platform status command. Without `--dry-run`, it runs
-  the read-only service status command for systemd user services, launchd agents, or Windows
-  scheduled tasks.
-- `rspm service start|stop|restart --dry-run` prints the platform control command. Without
-  `--dry-run`, rspm executes the corresponding systemd user, launchd, or Windows scheduled-task
-  command.
-- Cron scheduling uses the `chrono-tz` IANA timezone database and also accepts fixed
-  `UTC/GMT±offset` strings.
-- CI runs Rust format, tests, clippy, and daemon-backed smoke tests on Linux, Rust workspace/test-binary
-  compilation plus service dry-run CLI tests and daemon-backed smoke tests on macOS and Windows,
-  Windows named-pipe transport tests, and Python SDK tests on Linux. Local smoke testing remains
-  useful before release cuts.
-- Tag pushes matching `v*` build release binaries on Linux, macOS, and Windows and upload them as
-  workflow artifacts.
-- Windows named-pipe transport has Windows-only daemon/server and SDK transport tests in CI.
+`rspm` is licensed under the [MIT License](LICENSE).
