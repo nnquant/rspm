@@ -32,6 +32,7 @@ class TaskInfo:
     dependencies: list[str] = field(default_factory=list)
     dependents: list[str] = field(default_factory=list)
     schedule_state: str | None = None
+    display_timezone: str | None = None
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "TaskInfo":
@@ -56,6 +57,7 @@ class TaskInfo:
             dependencies=list(payload.get("dependencies", [])),
             dependents=list(payload.get("dependents", [])),
             schedule_state=payload.get("schedule_state"),
+            display_timezone=payload.get("display_timezone"),
         )
 
 
