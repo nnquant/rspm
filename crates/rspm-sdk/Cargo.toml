@@ -6,6 +6,8 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
+libc.workspace = true
 rspm-core = { path = "../rspm-core" }
 rspm-daemon = { path = "../rspm-daemon" }
 serde.workspace = true

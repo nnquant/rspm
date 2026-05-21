@@ -73,6 +73,77 @@ fn apply_validates_config_and_prints_planned_task_count() {
     assert!(stdout.contains("worker"));
 }
 
+#[test]
+fn add_shell_command_writes_task_to_config() {
+    let temp = TempDir::new().expect("temp dir");
+    let path = temp.path().join("rspm.toml");
+    let path_text = path.display().to_string();
+    let output = Command::new(env!("CARGO_BIN_EXE_rspm"))
+        .args([
+            "--no-daemon",
+            "add",
+            "-f",
+            &path_text,
+            "--name",
+            "alpha",
+            "uv run a.py",
+        ])
+        .output()
+        .expect("run cli");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let config_text = fs::read_to_string(&path).expect("config");
+
+    assert!(output.status.success());
+    assert!(stdout.contains("added [alpha] cmd=[uv] args=[run a.py]"));
+    assert!(config_text.contains("[tasks.alpha]"));
+    let config = ProjectConfig::from_toml_str(&config_text).expect("generated config");
+    let task = config.task("alpha").expect("alpha task");
+    assert_eq!(task.cmd, "uv");
+    assert_eq!(task.args, vec!["run", "a.py"]);
+}
+
+#[test]
+fn add_accepts_repeated_env_values_including_hyphen_prefixed_names() {
+    let temp = TempDir::new().expect("temp dir");
+    let path = temp.path().join("rspm.toml");
+    let path_text = path.display().to_string();
+    let output = Command::new(env!("CARGO_BIN_EXE_rspm"))
+        .env("ENV1", "one")
+        .env("ENV2", "two")
+        .args([
+            "--no-daemon",
+            "add",
+            "-f",
+            &path_text,
+            "--name",
+            "alpha",
+            "--env",
+            "ENV1",
+            "--env",
+            "--ENV2",
+            "--env",
+            "INLINE=three",
+            "uv run a.py",
+        ])
+        .output()
+        .expect("run cli");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "stdout=[{}] stderr=[{}]",
+        stdout,
+        stderr
+    );
+    let config_text = fs::read_to_string(&path).expect("config");
+    let config = ProjectConfig::from_toml_str(&config_text).expect("generated config");
+    let task = config.task("alpha").expect("alpha task");
+    assert_eq!(task.env.get("ENV1").map(String::as_str), Some("one"));
+    assert_eq!(task.env.get("ENV2").map(String::as_str), Some("two"));
+    assert_eq!(task.env.get("INLINE").map(String::as_str), Some("three"));
+}
+
 #[tokio::test]
 async fn cli_apply_sends_config_to_daemon_when_addr_is_set() {
     let temp = TempDir::new().expect("temp dir");
@@ -146,7 +217,7 @@ fn graph_prints_dependency_edges() {
 fn status_prints_docker_style_table_columns() {
     let (_temp, path) = write_config();
     let output = Command::new(env!("CARGO_BIN_EXE_rspm"))
-        .args(["--no-auto-daemon", "status", "-f", &path])
+        .args(["--no-daemon", "status", "-f", &path])
         .output()
         .expect("run cli");
 
@@ -162,6 +233,7 @@ fn status_prints_docker_style_table_columns() {
     assert!(stdout.contains("STOP_TIME"));
     assert!(!stdout.contains("STARTED_UTC"));
     assert!(!stdout.contains("STOPPED_UTC"));
+    assert!(stdout.contains("Timezone: local"));
     assert!(stdout.contains("master"));
     assert!(stdout.contains("worker"));
     assert!(stdout.contains("oneshot"));
@@ -171,7 +243,7 @@ fn status_prints_docker_style_table_columns() {
 fn ls_prints_docker_style_table_columns() {
     let (_temp, path) = write_config();
     let output = Command::new(env!("CARGO_BIN_EXE_rspm"))
-        .args(["--no-auto-daemon", "ls", "-f", &path])
+        .args(["--no-daemon", "ls", "-f", &path])
         .output()
         .expect("run cli");
 
@@ -182,6 +254,7 @@ fn ls_prints_docker_style_table_columns() {
     assert!(stdout.contains("NAME"));
     assert!(stdout.contains("PID"));
     assert!(stdout.contains("STATUS"));
+    assert!(stdout.contains("Timezone: local"));
     assert!(stdout.contains("master"));
     assert!(stdout.contains("worker"));
 }
@@ -1222,13 +1295,13 @@ async fn cli_sends_configured_auth_token_to_daemon() {
 
     wait_for_daemon(address).await;
 
-    let missing = run_cli(&["--addr", &address.to_string(), "--no-auto-daemon", "ls"]).await;
+    let missing = run_cli(&["--addr", &address.to_string(), "--no-daemon", "ls"]).await;
     let accepted = run_cli(&[
         "--addr",
         &address.to_string(),
         "--token",
         "secret-token",
-        "--no-auto-daemon",
+        "--no-daemon",
         "ls",
     ])
     .await;

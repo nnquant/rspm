@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -8,11 +9,18 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use rspm_core::api::RpcRequest;
-use rspm_core::config::{ProjectConfig, RestartPolicy, TaskConfig};
+use rspm_core::config::{ProjectConfig, ProjectSection, TaskConfig};
 use rspm_core::dag::TaskGraph;
+use rspm_core::display::format_display_time;
 use rspm_core::event::TaskEvent;
 use rspm_core::state::{TaskInfo, TaskStatus};
 use rspm_daemon::daemon::{run_daemon, DaemonOptions};
+use rspm_sdk::render::{
+    colored_health_label, colored_status_label, format_bytes, format_duration,
+    format_merged_logs as render_merged_logs, format_offline_task_table,
+    format_prefixed_logs as render_prefixed_logs, format_task_table, status_label,
+    RenderLogOptions,
+};
 use rspm_sdk::TcpRspmClient;
 
 #[derive(Debug, Parser)]
@@ -35,8 +43,8 @@ struct Cli {
     #[arg(long, global = true)]
     token: Option<String>,
 
-    #[arg(long, global = true)]
-    no_auto_daemon: bool,
+    #[arg(long = "no-daemon", alias = "no-auto-daemon", global = true)]
+    no_daemon: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -53,6 +61,19 @@ enum Command {
         file: PathBuf,
         #[arg(long)]
         dry_run: bool,
+    },
+    Add {
+        command: String,
+        #[arg(short, long, default_value = "rspm.toml")]
+        file: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long, value_name = "KEY[=VALUE]", allow_hyphen_values = true)]
+        env: Vec<String>,
+        #[arg(long)]
+        no_apply: bool,
     },
     Graph {
         #[arg(short, long, default_value = "rspm.toml")]
@@ -226,7 +247,7 @@ async fn main() -> Result<()> {
         cli.state_dir.clone(),
         cli.socket_path.clone(),
         cli.token.or_else(|| std::env::var("RSPM_TOKEN").ok()),
-        !cli.no_auto_daemon,
+        !cli.no_daemon,
     );
 
     match cli.command {
@@ -262,6 +283,31 @@ async fn main() -> Result<()> {
             }
             println!("start_order={}", plan.start_order.join(","));
             println!("stop_order={}", plan.stop_order.join(","));
+        }
+        Command::Add {
+            command,
+            file,
+            name,
+            cwd,
+            env,
+            no_apply,
+        } => {
+            let (config, task_name, task) = add_task_to_config(&file, &command, name, cwd, env)?;
+            write_config(&file, &config)?;
+            println!(
+                "added [{}] cmd=[{}] args=[{}]",
+                task_name,
+                task.cmd,
+                task.args.join(" ")
+            );
+            if !no_apply && daemon.should_use_daemon() {
+                let addr = daemon.ensure(&file).await?;
+                let text = fs::read_to_string(&file)
+                    .with_context(|| format!("failed to read config [{}]", file.display()))?;
+                let tasks = daemon_apply(addr, &text, daemon.token()).await?;
+                println!("applied [{}] tasks={}", config.project.name, tasks.len());
+                print_task_status(&tasks);
+            }
         }
         Command::Graph { file, format } => {
             let config = read_config(&file)?;
@@ -401,8 +447,12 @@ async fn main() -> Result<()> {
         }
         Command::Events => {
             let addr = daemon.ensure(&PathBuf::from("rspm.toml")).await?;
+            let tasks = daemon_list(addr, daemon.token()).await?;
+            let display_timezone = tasks
+                .iter()
+                .find_map(|task| task.display_timezone.as_deref());
             let events = daemon_events(addr, daemon.token()).await?;
-            print_events(&events);
+            print_events(&events, display_timezone);
         }
         Command::Doctor { config, log_dir } => {
             let doctor_daemon = daemon.with_log_dir(log_dir.clone());
@@ -596,99 +646,199 @@ fn read_config(path: &PathBuf) -> Result<ProjectConfig> {
     ProjectConfig::from_toml_str(&text).context("failed to load config")
 }
 
-fn print_offline_status(config: &ProjectConfig) {
-    println!(
-        "{:<8} {:<16} {:<10} {:<8} {:<12} {:<8} {:<8} {:<10} {:<15} {:<15} {:<8} {:<8} NEXT",
-        "TASK_ID",
-        "NAME",
-        "MODE",
-        "PID",
-        "STATUS",
-        "HEALTH",
-        "RESTARTS",
-        "UPTIME",
-        "START_TIME",
-        "STOP_TIME",
-        "CPU",
-        "MEM"
+fn write_config(path: &Path, config: &ProjectConfig) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create config directory [{}]", parent.display()))?;
+    }
+    let text = toml::to_string_pretty(config).context("failed to serialize config")?;
+    fs::write(path, text).with_context(|| format!("failed to write config [{}]", path.display()))
+}
+
+fn add_task_to_config(
+    path: &Path,
+    command: &str,
+    name: Option<String>,
+    cwd: Option<String>,
+    env: Vec<String>,
+) -> Result<(ProjectConfig, String, TaskConfig)> {
+    let mut config = if path.exists() {
+        read_config(&path.to_path_buf())?
+    } else {
+        empty_project_config()
+    };
+    let parts = parse_command_line(command)?;
+    let (cmd, args) = parts
+        .split_first()
+        .map(|(cmd, args)| (cmd.clone(), args.to_vec()))
+        .context("command cannot be empty")?;
+    let task_name = unique_task_name(
+        name.unwrap_or_else(|| infer_task_name(&cmd, &args)),
+        &config.tasks,
     );
-    for (index, (task_name, task)) in config.tasks.iter().enumerate() {
-        println!(
-            "{:<8} {:<16} {:<10} {:<8} {:<12} {:<8} {:<8} {:<10} {:<15} {:<15} {:<8} {:<8} -",
-            index + 1,
-            task_name,
-            config_task_run_mode(config, task),
-            "-",
-            "stopped",
-            "-",
-            0,
-            "-",
-            "-",
-            "-",
-            "-",
-            "-"
-        );
+    let task = TaskConfig {
+        cmd,
+        args,
+        cwd,
+        autostart: false,
+        env: parse_env_overrides(env)?,
+        restart: None,
+        depends_on: Vec::new(),
+        start_when: Default::default(),
+        health: None,
+        schedule: None,
+        watch: None,
+        limits: None,
+        logs: None,
+        reload: None,
+        cron: BTreeMap::new(),
+    };
+    config.tasks.insert(task_name.clone(), task.clone());
+    config.validate().context("generated config is invalid")?;
+    Ok((config, task_name, task))
+}
+
+fn parse_env_overrides(values: Vec<String>) -> Result<BTreeMap<String, String>> {
+    let mut env = BTreeMap::new();
+    for value in values {
+        let normalized = value.trim_start_matches("--");
+        if normalized.is_empty() {
+            anyhow::bail!("env key cannot be empty");
+        }
+        let (key, env_value) = if let Some((key, explicit_value)) = normalized.split_once('=') {
+            (key.to_string(), explicit_value.to_string())
+        } else {
+            (
+                normalized.to_string(),
+                std::env::var(normalized).unwrap_or_default(),
+            )
+        };
+        validate_env_key(&key)?;
+        env.insert(key, env_value);
+    }
+    Ok(env)
+}
+
+fn validate_env_key(key: &str) -> Result<()> {
+    let valid = key
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        && key
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_');
+    if valid {
+        Ok(())
+    } else {
+        anyhow::bail!("invalid env key [{key}]")
     }
 }
 
-fn print_task_status(tasks: &[TaskInfo]) {
-    println!(
-        "{:<8} {:<16} {:<10} {:<8} {:<12} {:<8} {:<8} {:<10} {:<15} {:<15} {:<8} {:<8} NEXT",
-        "TASK_ID",
-        "NAME",
-        "MODE",
-        "PID",
-        "STATUS",
-        "HEALTH",
-        "RESTARTS",
-        "UPTIME",
-        "START_TIME",
-        "STOP_TIME",
-        "CPU",
-        "MEM"
-    );
-    for task in tasks {
-        let status = colored_status_cell(task.status);
-        let health = colored_health_cell(task.health.as_deref().unwrap_or("-"));
-        let restarts = colored_restarts_cell(task.restart_count);
-        let cpu_text = task.cpu_percent.map(format_cpu_percent);
-        let cpu = colored_cpu_cell(cpu_text.as_deref().unwrap_or("-"));
-        let memory = colored_memory_cell(task.memory_bytes);
-        let pid = task
-            .pid
-            .map(|pid| pid.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let uptime = task
-            .uptime_ms
-            .map(format_duration)
-            .unwrap_or_else(|| "-".to_string());
-        let started = task
-            .started_at
-            .as_ref()
-            .map(format_task_time)
-            .unwrap_or_else(|| "-".to_string());
-        let stopped = task
-            .stopped_at
-            .as_ref()
-            .map(format_task_time)
-            .unwrap_or_else(|| "-".to_string());
-        println!(
-            "{:<8} {:<16} {:<10} {:<8} {} {} {} {:<10} {:<15} {:<15} {} {} {}",
-            task.task_id,
-            task.name,
-            display_run_mode(task),
-            pid,
-            status,
-            health,
-            restarts,
-            uptime,
-            started,
-            stopped,
-            cpu,
-            memory,
-            task.schedule_state.as_deref().unwrap_or("-")
-        );
+fn empty_project_config() -> ProjectConfig {
+    ProjectConfig {
+        project: ProjectSection::default(),
+        defaults: Default::default(),
+        tasks: BTreeMap::new(),
     }
+}
+
+fn parse_command_line(command: &str) -> Result<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        match quote {
+            Some(active) if ch == active => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+    if let Some(quote) = quote {
+        anyhow::bail!("unterminated quote [{quote}] in command [{command}]");
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    if parts.is_empty() {
+        anyhow::bail!("command cannot be empty");
+    }
+    Ok(parts)
+}
+
+fn infer_task_name(cmd: &str, args: &[String]) -> String {
+    let candidate = args
+        .iter()
+        .rev()
+        .find(|arg| arg.ends_with(".py") || arg.ends_with(".rs") || arg.contains('/'))
+        .map(String::as_str)
+        .unwrap_or(cmd);
+    sanitize_task_name(
+        Path::new(candidate)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(candidate),
+    )
+}
+
+fn sanitize_task_name(value: &str) -> String {
+    let mut name = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    name = name.trim_matches('_').to_string();
+    if name.is_empty() {
+        "task".to_string()
+    } else {
+        name
+    }
+}
+
+fn unique_task_name(base: String, tasks: &BTreeMap<String, TaskConfig>) -> String {
+    if !tasks.contains_key(&base) {
+        return base;
+    }
+    for index in 2.. {
+        let candidate = format!("{base}-{index}");
+        if !tasks.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded task name suffix search should always return")
+}
+
+fn print_offline_status(config: &ProjectConfig) {
+    print!("{}", format_offline_task_table(config));
+}
+
+fn print_task_status(tasks: &[TaskInfo]) {
+    print!("{}", format_task_table(tasks));
 }
 
 fn print_monit_snapshot(addr: SocketAddr, tasks: &[TaskInfo]) {
@@ -734,14 +884,14 @@ fn print_task_description(task: &TaskInfo) {
         "start_time: {}",
         task.started_at
             .as_ref()
-            .map(DateTime::<Utc>::to_rfc3339)
+            .map(|time| format_task_time(time, task.display_timezone.as_deref()))
             .unwrap_or_else(|| "-".to_string())
     );
     println!(
         "stop_time: {}",
         task.stopped_at
             .as_ref()
-            .map(DateTime::<Utc>::to_rfc3339)
+            .map(|time| format_task_time(time, task.display_timezone.as_deref()))
             .unwrap_or_else(|| "-".to_string())
     );
     println!(
@@ -1237,12 +1387,14 @@ struct LogPrintOptions<'a> {
     merge: bool,
 }
 
-#[derive(Debug)]
-struct LogLine {
-    task: String,
-    line: String,
-    timestamp: Option<DateTime<Utc>>,
-    sequence: usize,
+impl From<LogPrintOptions<'_>> for RenderLogOptions {
+    fn from(value: LogPrintOptions<'_>) -> Self {
+        Self {
+            lines: value.lines,
+            grep: value.grep.map(ToString::to_string),
+            since: value.since,
+        }
+    }
 }
 
 async fn print_task_logs(
@@ -1333,67 +1485,15 @@ async fn follow_logs(
 }
 
 fn print_prefixed_logs(task: &str, logs: &str, options: LogPrintOptions<'_>) -> Result<()> {
-    for line in selected_log_lines(logs, options) {
-        print!("{task} | {line}");
-    }
-    if !logs.is_empty() && !logs.ends_with('\n') {
-        println!();
-    }
+    print!("{}", render_prefixed_logs(task, logs, &options.into()));
     std::io::stdout().flush()?;
     Ok(())
 }
 
 fn print_merged_logs(logs: &[(String, String)], options: LogPrintOptions<'_>) -> Result<()> {
-    let mut lines = Vec::new();
-    let mut sequence = 0_usize;
-    for (task, log) in logs {
-        for line in selected_log_lines(log, options) {
-            lines.push(LogLine {
-                task: task.clone(),
-                timestamp: line_timestamp(&line),
-                line,
-                sequence,
-            });
-            sequence += 1;
-        }
-    }
-    lines.sort_by(|left, right| match (left.timestamp, right.timestamp) {
-        (Some(left_ts), Some(right_ts)) => left_ts
-            .cmp(&right_ts)
-            .then_with(|| left.sequence.cmp(&right.sequence)),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => left.sequence.cmp(&right.sequence),
-    });
-    for line in lines {
-        print!("{} | {}", line.task, line.line);
-    }
+    print!("{}", render_merged_logs(logs, &options.into()));
     std::io::stdout().flush()?;
     Ok(())
-}
-
-fn selected_log_lines(logs: &str, options: LogPrintOptions<'_>) -> Vec<String> {
-    let mut selected = logs
-        .split_inclusive('\n')
-        .filter(|line| options.grep.is_none_or(|grep| line.contains(grep)))
-        .filter(|line| {
-            options.since.is_none_or(|since| {
-                line_timestamp(line).is_some_and(|timestamp| timestamp >= since)
-            })
-        })
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if let Some(lines) = options.lines {
-        selected = selected
-            .into_iter()
-            .rev()
-            .take(lines)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-    }
-    selected
 }
 
 fn parse_since_timestamp(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
@@ -1405,17 +1505,6 @@ fn parse_since_timestamp(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
             .with_context(|| format!("invalid --since timestamp [{value}]"))?
             .with_timezone(&Utc),
     ))
-}
-
-fn line_timestamp(line: &str) -> Option<DateTime<Utc>> {
-    line.split_whitespace().find_map(|token| {
-        let token = token.trim_matches(|ch: char| {
-            !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | ':' | '.' | '+' | 'Z' | 'T'))
-        });
-        DateTime::parse_from_rfc3339(token)
-            .ok()
-            .map(|time| time.with_timezone(&Utc))
-    })
 }
 
 async fn daemon_task_action(
@@ -1503,12 +1592,12 @@ async fn daemon_apply(
     Ok(serde_json::from_value(result)?)
 }
 
-fn print_events(events: &[TaskEvent]) {
+fn print_events(events: &[TaskEvent], display_timezone: Option<&str>) {
     println!("{:<26} {:<16} {:<18} REASON", "TIMESTAMP", "TASK", "EVENT");
     for event in events {
         println!(
             "{:<26} {:<16} {:<18} {}",
-            event.timestamp.to_rfc3339(),
+            format_task_time(&event.timestamp, display_timezone),
             event.task.as_deref().unwrap_or("-"),
             event_label(&event.event_type),
             event.reason.as_deref().unwrap_or("-")
@@ -1537,122 +1626,6 @@ fn default_daemon_addr() -> SocketAddr {
         .expect("default daemon address must be valid")
 }
 
-fn status_label(status: TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Defined => "defined",
-        TaskStatus::Scheduled => "scheduled",
-        TaskStatus::WaitingDependency => "waiting",
-        TaskStatus::Starting => "starting",
-        TaskStatus::Online => "online",
-        TaskStatus::Healthy => "healthy",
-        TaskStatus::Unhealthy => "unhealthy",
-        TaskStatus::Stopping => "stopping",
-        TaskStatus::Stopped => "stopped",
-        TaskStatus::Failed => "failed",
-        TaskStatus::Backoff => "backoff",
-        TaskStatus::Disabled => "disabled",
-    }
-}
-
-fn colored_status_cell(status: TaskStatus) -> String {
-    colorize_status(status, &format!("{:<12}", status_label(status)))
-}
-
-fn colored_status_label(status: TaskStatus) -> String {
-    colorize_status(status, status_label(status))
-}
-
-fn colorize_status(status: TaskStatus, value: &str) -> String {
-    let color = match status {
-        TaskStatus::Online | TaskStatus::Healthy => "32",
-        TaskStatus::Unhealthy | TaskStatus::Failed | TaskStatus::Stopped => "31",
-        TaskStatus::Starting
-        | TaskStatus::Scheduled
-        | TaskStatus::WaitingDependency
-        | TaskStatus::Stopping => "33",
-        TaskStatus::Backoff => "35",
-        TaskStatus::Disabled | TaskStatus::Defined => "90",
-    };
-    format!("\x1b[{color}m{value}\x1b[0m")
-}
-
-fn colored_health_cell(health: &str) -> String {
-    colorize_health(health, &format!("{health:<8}"))
-}
-
-fn colored_health_label(health: &str) -> String {
-    colorize_health(health, health)
-}
-
-fn colorize_health(health: &str, value: &str) -> String {
-    match health {
-        "ok" => format!("\x1b[32m{value}\x1b[0m"),
-        "fail" => format!("\x1b[31m{value}\x1b[0m"),
-        "-" => value.to_string(),
-        _ => format!("\x1b[33m{value}\x1b[0m"),
-    }
-}
-
-fn colored_restarts_cell(restart_count: u32) -> String {
-    let value = format!("{restart_count:<8}");
-    if restart_count >= 3 {
-        format!("\x1b[33m{value}\x1b[0m")
-    } else {
-        value
-    }
-}
-
-fn colored_cpu_cell(cpu: &str) -> String {
-    let value = format!("{cpu:<8}");
-    if parse_cpu_percent(cpu).is_some_and(|percent| percent >= 80.0) {
-        format!("\x1b[33m{value}\x1b[0m")
-    } else {
-        value
-    }
-}
-
-fn format_cpu_percent(cpu_percent: f64) -> String {
-    format!("{cpu_percent:.1}%")
-}
-
-fn colored_memory_cell(memory_bytes: Option<u64>) -> String {
-    let value = memory_bytes
-        .map(format_bytes)
-        .unwrap_or_else(|| "-".to_string());
-    let value = format!("{value:<8}");
-    if memory_bytes.is_some_and(|bytes| bytes >= 512 * 1024 * 1024) {
-        format!("\x1b[33m{value}\x1b[0m")
-    } else {
-        value
-    }
-}
-
-fn parse_cpu_percent(cpu: &str) -> Option<f64> {
-    let value = cpu.trim().strip_suffix('%').unwrap_or(cpu.trim());
-    value.parse::<f64>().ok()
-}
-
-fn config_task_run_mode(config: &ProjectConfig, task: &TaskConfig) -> &'static str {
-    if task
-        .schedule
-        .as_ref()
-        .is_some_and(|schedule| schedule.start.is_some() || schedule.stop.is_some())
-    {
-        return "scheduled";
-    }
-
-    if !task.cron.is_empty() {
-        return "cron";
-    }
-
-    let restart_policy = task.restart.unwrap_or(config.defaults.restart);
-    if restart_policy != RestartPolicy::Never || task.health.is_some() || task.watch.is_some() {
-        return "long";
-    }
-
-    "oneshot"
-}
-
 fn display_run_mode(task: &TaskInfo) -> &str {
     if task.run_mode.is_empty() {
         "-"
@@ -1661,8 +1634,8 @@ fn display_run_mode(task: &TaskInfo) -> &str {
     }
 }
 
-fn format_task_time(time: &DateTime<Utc>) -> String {
-    time.format("%m-%d %H:%M:%SZ").to_string()
+fn format_task_time(time: &DateTime<Utc>, display_timezone: Option<&str>) -> String {
+    format_display_time(time, display_timezone)
 }
 
 #[cfg(test)]
@@ -1679,22 +1652,32 @@ mod tests {
     }
 
     #[test]
-    fn stopped_status_is_red() {
-        assert!(colored_status_cell(TaskStatus::Stopped).starts_with("\x1b[31m"));
-    }
-
-    #[test]
-    fn high_restart_count_is_yellow() {
-        assert_eq!(colored_restarts_cell(3), "\x1b[33m3       \x1b[0m");
-    }
-
-    #[test]
-    fn high_cpu_and_memory_cells_are_yellow() {
-        assert_eq!(colored_cpu_cell("80%"), "\x1b[33m80%     \x1b[0m");
+    fn command_line_parser_handles_quotes() {
         assert_eq!(
-            colored_memory_cell(Some(512 * 1024 * 1024)),
-            "\x1b[33m512MB   \x1b[0m"
+            parse_command_line(r#"uv run "a script.py" --flag value"#).unwrap(),
+            vec!["uv", "run", "a script.py", "--flag", "value"]
         );
+    }
+
+    #[test]
+    fn task_name_prefers_python_script_stem() {
+        assert_eq!(
+            infer_task_name("uv", &["run".to_string(), "scripts/a.py".to_string()]),
+            "a"
+        );
+    }
+
+    #[test]
+    fn env_overrides_copy_current_env_or_accept_inline_values() {
+        std::env::set_var("RSPM_TEST_ENV1", "one");
+        let env = parse_env_overrides(vec![
+            "RSPM_TEST_ENV1".to_string(),
+            "--RSPM_TEST_ENV2=two".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(env.get("RSPM_TEST_ENV1").map(String::as_str), Some("one"));
+        assert_eq!(env.get("RSPM_TEST_ENV2").map(String::as_str), Some("two"));
     }
 
     #[test]
@@ -1707,42 +1690,6 @@ mod tests {
         assert_eq!(initial_log_offsets(&tasks, true), vec![0, 0]);
         assert_eq!(initial_log_offsets(&tasks, false), vec![10, 9]);
     }
-}
-
-fn format_duration(uptime_ms: u64) -> String {
-    let seconds = uptime_ms / 1_000;
-    if seconds < 60 {
-        return format!("{seconds}s");
-    }
-    let minutes = seconds / 60;
-    if minutes < 60 {
-        let seconds = seconds % 60;
-        return format!("{minutes}m{seconds}s");
-    }
-    let hours = minutes / 60;
-    if hours < 24 {
-        let minutes = minutes % 60;
-        return format!("{hours}h{minutes}m");
-    }
-    let days = hours / 24;
-    let hours = hours % 24;
-    format!("{days}d{hours}h")
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-    if bytes >= GB {
-        return format!("{}GB", bytes / GB);
-    }
-    if bytes >= MB {
-        return format!("{}MB", bytes / MB);
-    }
-    if bytes >= KB {
-        return format!("{}KB", bytes / KB);
-    }
-    format!("{bytes}B")
 }
 
 fn service_template(config: &Path, addr: &str) -> String {
