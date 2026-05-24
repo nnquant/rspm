@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command as StdCommand, ExitStatus, Stdio};
-use std::time::Duration;
+use std::process::{Command as StdCommand, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -22,6 +22,7 @@ pub struct TaskRuntime {
     log_dir: PathBuf,
     running: BTreeMap<String, ManagedTask>,
     restored_pids: BTreeMap<String, u32>,
+    restored_stop_requests: BTreeMap<String, RestoredStopRequest>,
     restart_counts: BTreeMap<String, u32>,
     last_started_at: BTreeMap<String, DateTime<Utc>>,
     last_stopped_at: BTreeMap<String, DateTime<Utc>>,
@@ -39,6 +40,14 @@ struct WatchSnapshot {
     len: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RestoredStopRequest {
+    status: TaskStatus,
+    requested_at: Instant,
+    force_kill_sent: bool,
+    pending_restart: bool,
+}
+
 impl TaskRuntime {
     pub fn new(config: ProjectConfig, log_dir: impl AsRef<Path>) -> Result<Self> {
         let log_dir = log_dir.as_ref().to_path_buf();
@@ -50,6 +59,7 @@ impl TaskRuntime {
             log_dir,
             running: BTreeMap::new(),
             restored_pids: BTreeMap::new(),
+            restored_stop_requests: BTreeMap::new(),
             restart_counts: BTreeMap::new(),
             last_started_at: BTreeMap::new(),
             last_stopped_at: BTreeMap::new(),
@@ -168,48 +178,138 @@ impl TaskRuntime {
     }
 
     pub async fn stop_task(&mut self, task_name: &str) -> Result<TaskInfo> {
-        let Some(mut managed) = self.running.remove(task_name) else {
-            if let Some(pid) = self.restored_pids.remove(task_name) {
-                if is_process_alive(pid) {
-                    terminate_pid(pid, self.kill_timeout())
-                        .await
-                        .with_context(|| format!("failed to stop restored task [{task_name}]"))?;
+        let Some(managed) = self.running.get_mut(task_name) else {
+            if let Some(pid) = self.restored_pids.get(task_name).copied() {
+                if let Some(request) = self.restored_stop_requests.get(task_name) {
+                    return self.describe_task(task_name).map(|mut info| {
+                        info.status = request.status;
+                        info
+                    });
                 }
-                self.record_restored_task_stop(task_name, None);
-                let info = self.describe_stopped_task(task_name, None, Utc::now())?;
+                if !is_process_alive(pid) {
+                    self.restored_pids.remove(task_name);
+                    self.record_restored_task_stop(task_name, None);
+                    let info = self.describe_stopped_task(task_name, None, Utc::now())?;
+                    self.health_states.remove(task_name);
+                    self.push_task_event(
+                        task_name,
+                        EventType::TaskStopped,
+                        Some(TaskStatus::Online),
+                        Some(TaskStatus::Stopped),
+                        Some("stop".to_string()),
+                    );
+                    return Ok(info);
+                }
+                send_term_to_pid(pid)
+                    .await
+                    .with_context(|| format!("failed to stop restored task [{task_name}]"))?;
+                self.restored_stop_requests.insert(
+                    task_name.to_string(),
+                    RestoredStopRequest {
+                        status: TaskStatus::Stopping,
+                        requested_at: Instant::now(),
+                        force_kill_sent: false,
+                        pending_restart: false,
+                    },
+                );
                 self.health_states.remove(task_name);
                 self.push_task_event(
                     task_name,
                     EventType::TaskStopped,
                     Some(TaskStatus::Online),
-                    Some(TaskStatus::Stopped),
+                    Some(TaskStatus::Stopping),
                     Some("stop".to_string()),
                 );
-                return Ok(info);
+                return self.describe_task(task_name);
             }
             return self.describe_stopped_task(task_name, None, Utc::now());
         };
 
+        if matches!(
+            managed.status,
+            TaskStatus::Stopping | TaskStatus::Restarting
+        ) {
+            return self.describe_task(task_name);
+        }
+
+        let status_before = managed.status;
         managed.status = TaskStatus::Stopping;
-        let kill_timeout = self.kill_timeout();
-        let status = stop_child(&mut managed.child, kill_timeout)
+        managed.stop_requested_at = Some(Instant::now());
+        managed.force_kill_sent = false;
+        managed.pending_restart = false;
+        self.health_states.remove(task_name);
+        send_graceful_terminate(&managed.child)
             .await
             .with_context(|| format!("failed to stop task [{task_name}]"))?;
-        let exit_code = status.code();
-        self.record_task_stop(task_name, &managed, exit_code);
-        let info = self.describe_stopped_task(task_name, exit_code, Utc::now())?;
-        self.health_states.remove(task_name);
         self.push_task_event(
             task_name,
             EventType::TaskStopped,
+            Some(status_before),
             Some(TaskStatus::Stopping),
-            Some(TaskStatus::Stopped),
             Some("stop".to_string()),
         );
-        Ok(info)
+        self.describe_task(task_name)
     }
 
     pub async fn restart_task(&mut self, task_name: &str) -> Result<TaskInfo> {
+        if let Some(managed) = self.running.get_mut(task_name) {
+            if managed.status == TaskStatus::Restarting {
+                return self.describe_task(task_name);
+            }
+            let status_before = managed.status;
+            managed.status = TaskStatus::Restarting;
+            managed.stop_requested_at = Some(Instant::now());
+            managed.force_kill_sent = false;
+            managed.pending_restart = true;
+            self.health_states.remove(task_name);
+            send_graceful_terminate(&managed.child)
+                .await
+                .with_context(|| format!("failed to restart task [{task_name}]"))?;
+            self.push_task_event(
+                task_name,
+                EventType::TaskRestarted,
+                Some(status_before),
+                Some(TaskStatus::Restarting),
+                Some("restart".to_string()),
+            );
+            return self.describe_task(task_name);
+        }
+
+        if let Some(pid) = self.restored_pids.get(task_name).copied() {
+            if let Some(request) = self.restored_stop_requests.get(task_name) {
+                if request.status == TaskStatus::Restarting {
+                    return self.describe_task(task_name);
+                }
+            }
+            if !is_process_alive(pid) {
+                self.restored_pids.remove(task_name);
+                self.restored_stop_requests.remove(task_name);
+                self.record_restored_task_stop(task_name, None);
+                return self.start_task(task_name).await;
+            }
+            send_term_to_pid(pid)
+                .await
+                .with_context(|| format!("failed to restart restored task [{task_name}]"))?;
+            self.restored_stop_requests.insert(
+                task_name.to_string(),
+                RestoredStopRequest {
+                    status: TaskStatus::Restarting,
+                    requested_at: Instant::now(),
+                    force_kill_sent: false,
+                    pending_restart: true,
+                },
+            );
+            self.health_states.remove(task_name);
+            self.push_task_event(
+                task_name,
+                EventType::TaskRestarted,
+                Some(TaskStatus::Online),
+                Some(TaskStatus::Restarting),
+                Some("restart".to_string()),
+            );
+            return self.describe_task(task_name);
+        }
+
         let _ = self.stop_task(task_name).await?;
         self.start_task(task_name).await
     }
@@ -279,8 +379,23 @@ impl TaskRuntime {
 
     pub async fn reconcile_exited_tasks(&mut self) -> Result<Vec<TaskInfo>> {
         let mut exited = Vec::new();
+        let kill_timeout = self.kill_timeout();
 
         for (task_name, managed) in &mut self.running {
+            if matches!(
+                managed.status,
+                TaskStatus::Stopping | TaskStatus::Restarting
+            ) && !managed.force_kill_sent
+                && managed
+                    .stop_requested_at
+                    .is_some_and(|requested_at| requested_at.elapsed() >= kill_timeout)
+            {
+                managed
+                    .child
+                    .start_kill()
+                    .with_context(|| format!("failed to force kill task [{task_name}]"))?;
+                managed.force_kill_sent = true;
+            }
             if let Some(status) = managed
                 .child
                 .try_wait()
@@ -290,6 +405,14 @@ impl TaskRuntime {
             }
         }
         for (task_name, pid) in &self.restored_pids {
+            if let Some(request) = self.restored_stop_requests.get_mut(task_name) {
+                if !request.force_kill_sent && request.requested_at.elapsed() >= kill_timeout {
+                    force_kill_pid(*pid).await.with_context(|| {
+                        format!("failed to force kill restored task [{task_name}]")
+                    })?;
+                    request.force_kill_sent = true;
+                }
+            }
             if !is_process_alive(*pid) {
                 exited.push((task_name.clone(), None));
             }
@@ -297,21 +420,33 @@ impl TaskRuntime {
 
         let mut restarted = Vec::new();
         for (task_name, exit_code) in exited {
+            let mut pending_manual_restart = false;
+            let mut status_before = TaskStatus::Online;
             if let Some(managed) = self.running.remove(&task_name) {
+                pending_manual_restart = managed.pending_restart;
+                status_before = managed.status;
                 self.record_task_stop(&task_name, &managed, exit_code);
             } else if self.restored_pids.remove(&task_name).is_some() {
+                if let Some(request) = self.restored_stop_requests.remove(&task_name) {
+                    pending_manual_restart = request.pending_restart;
+                    status_before = request.status;
+                }
                 self.record_restored_task_stop(&task_name, exit_code);
             }
             self.health_states.remove(&task_name);
             self.push_task_event(
                 &task_name,
                 EventType::TaskStopped,
-                Some(TaskStatus::Online),
+                Some(status_before),
                 Some(TaskStatus::Stopped),
                 Some("exit".to_string()),
             );
 
-            if self.should_restart(&task_name, exit_code)? {
+            if pending_manual_restart {
+                restarted.push(self.start_task(&task_name).await?);
+            } else if status_before != TaskStatus::Stopping
+                && self.should_restart(&task_name, exit_code)?
+            {
                 let next_count = self.restart_counts.get(&task_name).copied().unwrap_or(0) + 1;
                 self.restart_counts.insert(task_name.clone(), next_count);
                 self.push_task_event(
@@ -423,6 +558,17 @@ impl TaskRuntime {
             .collect::<Vec<_>>();
 
         for task_name in running_tasks {
+            if self.running.get(&task_name).is_some_and(|managed| {
+                matches!(
+                    managed.status,
+                    TaskStatus::Stopping | TaskStatus::Restarting
+                )
+            }) || self.restored_stop_requests.contains_key(&task_name)
+            {
+                self.health_states.remove(&task_name);
+                continue;
+            }
+
             let Some(health) = self
                 .config
                 .task(&task_name)
@@ -507,13 +653,14 @@ impl TaskRuntime {
             .await
             .with_context(|| format!("failed to wait for task [{task_name}]"))?;
         let exit_code = status.code();
+        let status_before = managed.status;
         self.record_task_stop(task_name, &managed, exit_code);
         let info = self.describe_stopped_task(task_name, exit_code, Utc::now())?;
         self.health_states.remove(task_name);
         self.push_task_event(
             task_name,
             EventType::TaskStopped,
-            Some(TaskStatus::Online),
+            Some(status_before),
             Some(TaskStatus::Stopped),
             Some("exit".to_string()),
         );
@@ -534,10 +681,13 @@ impl TaskRuntime {
         if let Some(managed) = self.running.get(task_name) {
             let uptime_ms = managed.started_at.elapsed().as_millis() as u64;
             let health = self.health_states.get(task_name).copied();
-            let status = match health {
-                Some(true) => TaskStatus::Healthy,
-                Some(false) => TaskStatus::Unhealthy,
-                None => managed.status,
+            let status = match managed.status {
+                TaskStatus::Stopping | TaskStatus::Restarting => managed.status,
+                _ => match health {
+                    Some(true) => TaskStatus::Healthy,
+                    Some(false) => TaskStatus::Unhealthy,
+                    None => managed.status,
+                },
             };
             return Ok(TaskInfo {
                 task_id: self.task_id(task_name)?,
@@ -576,10 +726,17 @@ impl TaskRuntime {
                         .max(0) as u64
                 });
                 let health = self.health_states.get(task_name).copied();
-                let status = match health {
-                    Some(true) => TaskStatus::Healthy,
-                    Some(false) => TaskStatus::Unhealthy,
-                    None => TaskStatus::Online,
+                let pending_status = self
+                    .restored_stop_requests
+                    .get(task_name)
+                    .map(|request| request.status);
+                let status = match pending_status {
+                    Some(TaskStatus::Stopping | TaskStatus::Restarting) => pending_status.unwrap(),
+                    _ => match health {
+                        Some(true) => TaskStatus::Healthy,
+                        Some(false) => TaskStatus::Unhealthy,
+                        None => TaskStatus::Online,
+                    },
                 };
                 return Ok(TaskInfo {
                     task_id: self.task_id(task_name)?,
@@ -981,35 +1138,6 @@ fn parse_duration(input: &str) -> Option<Duration> {
             .map(|minutes| Duration::from_secs(minutes * 60));
     }
     input.parse::<u64>().ok().map(Duration::from_secs)
-}
-
-async fn stop_child(
-    child: &mut tokio::process::Child,
-    kill_timeout: Duration,
-) -> Result<ExitStatus> {
-    send_graceful_terminate(child).await?;
-    match tokio::time::timeout(kill_timeout, child.wait()).await {
-        Ok(status) => Ok(status?),
-        Err(_) => {
-            let _ = child.kill().await;
-            child
-                .wait()
-                .await
-                .context("failed to wait after force killing child")
-        }
-    }
-}
-
-async fn terminate_pid(pid: u32, kill_timeout: Duration) -> Result<()> {
-    send_term_to_pid(pid).await?;
-    let deadline = tokio::time::Instant::now() + kill_timeout;
-    while tokio::time::Instant::now() < deadline {
-        if !is_process_alive(pid) {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    force_kill_pid(pid).await
 }
 
 #[cfg(unix)]

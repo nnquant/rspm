@@ -232,6 +232,7 @@ pub fn status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Healthy => "healthy",
         TaskStatus::Unhealthy => "unhealthy",
         TaskStatus::Stopping => "stopping",
+        TaskStatus::Restarting => "restarting",
         TaskStatus::Stopped => "stopped",
         TaskStatus::Failed => "failed",
         TaskStatus::Backoff => "backoff",
@@ -258,7 +259,8 @@ fn colorize_status(status: TaskStatus, value: &str) -> String {
         TaskStatus::Starting
         | TaskStatus::Scheduled
         | TaskStatus::WaitingDependency
-        | TaskStatus::Stopping => "33",
+        | TaskStatus::Stopping
+        | TaskStatus::Restarting => "33",
         TaskStatus::Backoff => "35",
         TaskStatus::Disabled | TaskStatus::Defined => "90",
     };

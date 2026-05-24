@@ -12,6 +12,7 @@ pub enum TaskStatus {
     Healthy,
     Unhealthy,
     Stopping,
+    Restarting,
     Stopped,
     Failed,
     Backoff,

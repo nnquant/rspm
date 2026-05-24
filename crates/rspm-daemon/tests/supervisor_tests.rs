@@ -1,5 +1,5 @@
 use std::fs;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rspm_core::config::ProjectConfig;
 use rspm_core::state::TaskStatus;
@@ -9,6 +9,30 @@ use tempfile::TempDir;
 
 fn config(input: &str) -> ProjectConfig {
     ProjectConfig::from_toml_str(input).expect("valid config")
+}
+
+async fn reconcile_until_status(
+    runtime: &mut TaskRuntime,
+    task_name: &str,
+    expected: TaskStatus,
+) -> rspm_core::state::TaskInfo {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let _ = runtime
+            .reconcile_exited_tasks()
+            .await
+            .expect("reconcile exits");
+        let info = runtime.describe_task(task_name).expect("task info");
+        if info.status == expected {
+            return info;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task [{task_name}] did not reach status [{expected:?}], last status [{:?}]",
+            info.status
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[test]
@@ -107,8 +131,12 @@ async fn stops_long_running_task_and_updates_task_info() {
     assert_eq!(running.status, TaskStatus::Online);
     assert!(running.pid.is_some());
 
-    let stopped = runtime.stop_task("sleeper").await.expect("stop task");
+    let stopping = runtime.stop_task("sleeper").await.expect("stop task");
 
+    assert_eq!(stopping.status, TaskStatus::Stopping);
+    assert!(stopping.pid.is_some());
+
+    let stopped = runtime.wait_task_exit("sleeper").await.expect("wait stop");
     assert_eq!(stopped.status, TaskStatus::Stopped);
     assert!(stopped.pid.is_none());
 }
@@ -135,11 +163,88 @@ async fn stop_task_sends_term_before_force_kill() {
     let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
 
     runtime.start_task("sleeper").await.expect("start task");
-    let stopped = runtime.stop_task("sleeper").await.expect("stop task");
+    let stopping = runtime.stop_task("sleeper").await.expect("stop task");
+    let stopped = runtime.wait_task_exit("sleeper").await.expect("wait stop");
 
+    assert_eq!(stopping.status, TaskStatus::Stopping);
     assert_eq!(stopped.status, TaskStatus::Stopped);
     assert_eq!(stopped.last_exit_code, Some(0));
     assert_eq!(fs::read_to_string(marker).expect("marker"), "term");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_task_returns_stopping_without_waiting_for_kill_timeout() {
+    let temp = TempDir::new().expect("temp dir");
+    let config = config(
+        r#"
+        [project]
+        name = "async-stop-test"
+
+        [defaults]
+        kill_timeout = "500ms"
+
+        [tasks.sleeper]
+        cmd = "python3"
+        args = ["-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"]
+        "#,
+    );
+    let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
+
+    runtime.start_task("sleeper").await.expect("start task");
+    let started = std::time::Instant::now();
+    let stopping = runtime.stop_task("sleeper").await.expect("stop task");
+
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "stop_task should return before kill_timeout elapses"
+    );
+    assert_eq!(stopping.status, TaskStatus::Stopping);
+    assert!(stopping.pid.is_some());
+
+    tokio::time::sleep(Duration::from_millis(550)).await;
+    let info = reconcile_until_status(&mut runtime, "sleeper", TaskStatus::Stopped).await;
+    assert_eq!(info.status, TaskStatus::Stopped);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn restart_task_returns_restarting_without_waiting_for_kill_timeout() {
+    let temp = TempDir::new().expect("temp dir");
+    let config = config(
+        r#"
+        [project]
+        name = "async-restart-test"
+
+        [defaults]
+        kill_timeout = "500ms"
+
+        [tasks.sleeper]
+        cmd = "python3"
+        args = ["-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"]
+        "#,
+    );
+    let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
+
+    runtime.start_task("sleeper").await.expect("start task");
+    let started = std::time::Instant::now();
+    let restarting = runtime.restart_task("sleeper").await.expect("restart task");
+
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "restart_task should return before kill_timeout elapses"
+    );
+    assert_eq!(restarting.status, TaskStatus::Restarting);
+    assert!(restarting.pid.is_some());
+
+    let old_pid = restarting.pid;
+    tokio::time::sleep(Duration::from_millis(550)).await;
+    let restarted = reconcile_until_status(&mut runtime, "sleeper", TaskStatus::Online).await;
+    assert_ne!(restarted.pid, old_pid);
+
+    runtime.stop_task("sleeper").await.expect("cleanup");
+    tokio::time::sleep(Duration::from_millis(550)).await;
+    let _ = reconcile_until_status(&mut runtime, "sleeper", TaskStatus::Stopped).await;
 }
 
 #[tokio::test]
@@ -183,6 +288,7 @@ async fn restarts_failed_task_according_to_restart_policy() {
     assert!(info.pid.is_some());
 
     runtime.stop_task("flaky").await.expect("cleanup");
+    runtime.wait_task_exit("flaky").await.expect("cleanup exit");
 }
 
 #[tokio::test]
@@ -252,9 +358,17 @@ async fn restarts_task_when_watched_file_changes() {
     let after = runtime.describe_task("worker").expect("after");
 
     assert_eq!(restarted.len(), 1);
-    assert_ne!(before.pid, after.pid);
+    assert_eq!(after.status, TaskStatus::Restarting);
+    assert_eq!(before.pid, after.pid);
+
+    let after_restart = reconcile_until_status(&mut runtime, "worker", TaskStatus::Online).await;
+    assert_ne!(before.pid, after_restart.pid);
 
     runtime.stop_task("worker").await.expect("cleanup");
+    runtime
+        .wait_task_exit("worker")
+        .await
+        .expect("cleanup exit");
 }
 
 #[tokio::test]
@@ -285,7 +399,15 @@ async fn restarts_task_when_memory_limit_is_exceeded() {
     let after = runtime.describe_task("worker").expect("after");
 
     assert_eq!(restarted.len(), 1);
-    assert_ne!(before.pid, after.pid);
+    assert_eq!(after.status, TaskStatus::Restarting);
+    assert_eq!(before.pid, after.pid);
+
+    let after_restart = reconcile_until_status(&mut runtime, "worker", TaskStatus::Online).await;
+    assert_ne!(before.pid, after_restart.pid);
 
     runtime.stop_task("worker").await.expect("cleanup");
+    runtime
+        .wait_task_exit("worker")
+        .await
+        .expect("cleanup exit");
 }

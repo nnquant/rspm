@@ -11,6 +11,9 @@ pub struct ManagedTask {
     pub restart_count: u32,
     pub last_exit_code: Option<i32>,
     pub status: TaskStatus,
+    pub stop_requested_at: Option<Instant>,
+    pub force_kill_sent: bool,
+    pub pending_restart: bool,
 }
 
 impl ManagedTask {
@@ -22,6 +25,9 @@ impl ManagedTask {
             restart_count: 0,
             last_exit_code: None,
             status: TaskStatus::Online,
+            stop_requested_at: None,
+            force_kill_sent: false,
+            pending_restart: false,
         }
     }
 }
