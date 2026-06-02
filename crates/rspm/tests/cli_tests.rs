@@ -768,7 +768,7 @@ async fn cli_start_status_and_stop_operate_through_daemon_tcp_transport() {
     let stop = run_cli(&["--addr", &address.to_string(), "stop", "sleeper"]).await;
     let stop_stdout = String::from_utf8_lossy(&stop.stdout);
     assert!(stop.status.success());
-    assert!(stop_stdout.contains("stopped"));
+    assert!(stop_stdout.contains("stopping"));
     assert!(stop_stdout.contains("TASK_ID"));
 
     server.abort();
@@ -900,8 +900,8 @@ async fn cli_start_all_and_stop_all_use_dag_order() {
     let stop = run_cli(&["--addr", &address.to_string(), "stop", "all"]).await;
     let stop_stdout = String::from_utf8_lossy(&stop.stdout);
     assert!(stop.status.success());
-    assert!(stop_stdout.contains("worker stopped"));
-    assert!(stop_stdout.contains("master stopped"));
+    assert!(stop_stdout.contains("worker stopping"));
+    assert!(stop_stdout.contains("master stopping"));
 
     server.abort();
 }
