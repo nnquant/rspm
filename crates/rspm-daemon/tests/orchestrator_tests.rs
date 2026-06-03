@@ -7,6 +7,8 @@ use rspm_daemon::orchestrator::{start_all, start_scheduled_active};
 use rspm_daemon::runtime::TaskRuntime;
 use tempfile::TempDir;
 
+mod common;
+
 #[tokio::test]
 async fn command_and_file_health_checks_report_real_status() {
     let temp = TempDir::new().expect("temp dir");
@@ -17,7 +19,7 @@ async fn command_and_file_health_checks_report_real_status() {
         kind: HealthCheckKind::Command,
         address: None,
         url: None,
-        command: Some("true".to_string()),
+        command: Some(common::health_success_command().to_string()),
         path: None,
         interval: None,
         timeout: None,
@@ -43,26 +45,27 @@ async fn command_and_file_health_checks_report_real_status() {
 #[tokio::test]
 async fn dependency_task_does_not_start_when_upstream_health_fails() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "orchestrator-test"
 
         [tasks.master]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
 
         [tasks.master.health]
         type = "command"
-        command = "false"
+        command = "{}"
 
         [tasks.worker]
-        cmd = "sh"
-        args = ["-c", "printf worker"]
+        {}
         depends_on = ["master"]
         start_when = "dependencies_healthy"
         "#,
-    )
+        common::sleep_task_command(),
+        common::toml_string(common::health_failure_command()),
+        common::print_task_command("worker")
+    ))
     .expect("valid config");
     let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
 
@@ -96,14 +99,14 @@ async fn successful_health_probe_marks_task_healthy() {
         name = "healthy-status-test"
 
         [tasks.master]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
 
         [tasks.master.health]
         type = "file"
         path = "{}"
         "#,
-        ready_path.display()
+        common::sleep_task_command(),
+        common::toml_path(&ready_path)
     ))
     .expect("valid config");
     let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
@@ -119,19 +122,17 @@ async fn successful_health_probe_marks_task_healthy() {
 #[tokio::test]
 async fn scheduled_active_startup_starts_task_and_dependencies() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "scheduled-active-startup"
         timezone = "Asia/Shanghai"
 
         [tasks.master]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
 
         [tasks.market]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
         depends_on = ["master"]
         start_when = "dependencies_started"
 
@@ -139,7 +140,9 @@ async fn scheduled_active_startup_starts_task_and_dependencies() {
         start = "30 8 * * *"
         stop = "00 15 * * *"
         "#,
-    )
+        common::sleep_task_command(),
+        common::sleep_task_command()
+    ))
     .expect("valid config");
     let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
 
@@ -176,8 +179,7 @@ async fn startup_health_probe_waits_for_delayed_ready_file() {
         name = "delayed-health-test"
 
         [tasks.master]
-        cmd = "sh"
-        args = ["-c", "sleep 0.2; touch '{}'; sleep 30"]
+        {}
 
         [tasks.master.health]
         type = "file"
@@ -186,8 +188,8 @@ async fn startup_health_probe_waits_for_delayed_ready_file() {
         success_after = 1
         failure_after = 10
         "#,
-        ready_path.display(),
-        ready_path.display(),
+        common::sleep_then_touch_task_command(&ready_path),
+        common::toml_path(&ready_path),
     ))
     .expect("valid config");
     let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");

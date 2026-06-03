@@ -8,6 +8,9 @@ use rspm_sdk::TcpRspmClient;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
+#[path = "../../rspm-daemon/tests/common/mod.rs"]
+mod common;
+
 #[tokio::test]
 async fn tcp_sdk_client_sends_request_to_daemon_transport() {
     let temp = TempDir::new().expect("temp dir");
@@ -45,16 +48,16 @@ async fn tcp_sdk_client_sends_request_to_daemon_transport() {
 #[tokio::test]
 async fn tcp_sdk_client_exposes_high_level_task_operations() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "transport-task-test"
 
         [tasks.echo]
-        cmd = "sh"
-        args = ["-c", "printf tcp-sdk"]
+        {}
         "#,
-    )
+        common::print_task_command("tcp-sdk")
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let mut api = DaemonApi::new(runtime);
@@ -83,20 +86,20 @@ async fn tcp_sdk_client_exposes_high_level_task_operations() {
 #[tokio::test]
 async fn tcp_sdk_client_reads_aggregate_task_logs() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "transport-aggregate-logs-test"
 
         [tasks.alpha]
-        cmd = "sh"
-        args = ["-c", "printf alpha-log"]
+        {}
 
         [tasks.beta]
-        cmd = "sh"
-        args = ["-c", "printf beta-log"]
+        {}
         "#,
-    )
+        common::print_task_command("alpha-log"),
+        common::print_task_command("beta-log")
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let mut api = DaemonApi::new(runtime);

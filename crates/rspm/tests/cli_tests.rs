@@ -1,14 +1,17 @@
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use rspm_core::config::ProjectConfig;
 use rspm_daemon::api::DaemonApi;
 use rspm_daemon::runtime::TaskRuntime;
 use rspm_daemon::server::serve_tcp;
-use tempfile::TempDir;
+use tempfile::{NamedTempFile, TempDir};
+
+#[path = "../../rspm-daemon/tests/common/mod.rs"]
+mod common;
 
 fn write_config() -> (TempDir, String) {
     let temp = TempDir::new().expect("temp dir");
@@ -334,14 +337,16 @@ async fn cli_monit_once_prints_monitor_snapshot() {
     let socket_path = temp.path().join("run").join("rspmd.sock");
     fs::write(
         &config_path,
-        r#"
+        format!(
+            r#"
         [project]
         name = "cli-monit-once-test"
 
         [tasks.sleeper]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
         "#,
+            common::sleep_task_command()
+        ),
     )
     .expect("write config");
 
@@ -481,20 +486,26 @@ async fn cli_daemon_start_stop_and_restart_manage_daemon_lifecycle() {
     assert!(stopped_status_stdout.contains("daemon: stopped"));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cli_daemon_restart_restores_running_tasks() {
     let temp = TempDir::new().expect("temp dir");
     let config_path = temp.path().join("rspm.toml");
     fs::write(
         &config_path,
-        r#"
+        format!(
+            r#"
         [project]
         name = "daemon-restart-restore-test"
 
+        [defaults]
+        kill_timeout = "100ms"
+
         [tasks.sleeper]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
         "#,
+            common::sleep_task_command()
+        ),
     )
     .expect("write config");
     let address = free_tcp_addr();
@@ -544,7 +555,12 @@ async fn cli_daemon_restart_restores_running_tasks() {
     .await;
     let restart_stdout = String::from_utf8_lossy(&restart_daemon.stdout);
 
-    assert!(restart_daemon.status.success());
+    assert!(
+        restart_daemon.status.success(),
+        "stdout=[{}] stderr=[{}]",
+        restart_stdout,
+        String::from_utf8_lossy(&restart_daemon.stderr)
+    );
     assert!(restart_stdout.contains("task_id=1 sleeper online"));
 
     let status = run_cli(&["--addr", &address_text, "ls"]).await;
@@ -569,6 +585,7 @@ async fn cli_daemon_restart_restores_running_tasks() {
     .await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cli_status_requires_a_real_daemon_rpc_response_before_reusing_port() {
     let (temp, path) = write_config();
@@ -604,11 +621,53 @@ async fn cli_status_requires_a_real_daemon_rpc_response_before_reusing_port() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     let _ = fake_server.await;
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("master"));
     assert!(stdout.contains("worker"));
 
     kill_daemon_from_state(&state_dir);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn cli_status_rejects_occupied_non_daemon_tcp_port() {
+    let (temp, path) = write_config();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake listener");
+    let address = listener.local_addr().expect("fake addr");
+    let log_dir = temp.path().join("logs");
+    let state_dir = temp.path().join("state");
+    let socket_path = temp.path().join("run").join("rspmd.sock");
+    let address_text = address.to_string();
+    let log_dir_text = log_dir.display().to_string();
+    let state_dir_text = state_dir.display().to_string();
+    let socket_path_text = socket_path.display().to_string();
+
+    let output = run_cli(&[
+        "--addr",
+        &address_text,
+        "--log-dir",
+        &log_dir_text,
+        "--state-dir",
+        &state_dir_text,
+        "--socket-path",
+        &socket_path_text,
+        "status",
+        "-f",
+        &path,
+    ])
+    .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("address is still in use"));
+    drop(listener);
 }
 
 #[test]
@@ -726,16 +785,16 @@ fn service_start_stop_and_restart_dry_run_print_platform_commands() {
 #[tokio::test]
 async fn cli_start_status_and_stop_operate_through_daemon_tcp_transport() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "cli-daemon-test"
 
         [tasks.sleeper]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
         "#,
-    )
+        common::sleep_task_command()
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let api = DaemonApi::new(runtime);
@@ -777,20 +836,20 @@ async fn cli_start_status_and_stop_operate_through_daemon_tcp_transport() {
 #[tokio::test]
 async fn cli_start_accepts_multiple_task_ids() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "cli-task-id-test"
 
         [tasks.master]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
 
         [tasks.worker]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
         "#,
-    )
+        common::sleep_task_command(),
+        common::sleep_task_command()
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let api = DaemonApi::new(runtime);
@@ -860,21 +919,21 @@ async fn cli_reload_reports_not_configured_without_faking_zero_downtime() {
 #[tokio::test]
 async fn cli_start_all_and_stop_all_use_dag_order() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "cli-all-test"
 
         [tasks.master]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
 
         [tasks.worker]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
         depends_on = ["master"]
         "#,
-    )
+        common::sleep_task_command(),
+        common::sleep_task_command()
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let api = DaemonApi::new(runtime);
@@ -909,20 +968,20 @@ async fn cli_start_all_and_stop_all_use_dag_order() {
 #[tokio::test]
 async fn cli_logs_reads_daemon_managed_task_log() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "cli-log-test"
 
         [tasks.echo]
-        cmd = "sh"
-        args = ["-c", "printf '\\033[32mINFO\\033[0m cli-log-line\\nDEBUG cli-log-tail\\n'"]
+        {}
 
         [tasks.second]
-        cmd = "sh"
-        args = ["-c", "printf second-log-line\\n"]
+        {}
         "#,
-    )
+        common::print_task_command("\x1b[32mINFO\x1b[0m cli-log-line\nDEBUG cli-log-tail\n"),
+        common::print_task_command("second-log-line\n")
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let api = DaemonApi::new(runtime);
@@ -942,7 +1001,7 @@ async fn cli_logs_reads_daemon_managed_task_log() {
 
     let start = run_cli(&["--addr", &address.to_string(), "start", "all"]).await;
     assert!(start.status.success());
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let logs = run_cli(&["--addr", &address.to_string(), "logs", "echo"]).await;
     let stdout = String::from_utf8_lossy(&logs.stdout);
@@ -1019,20 +1078,24 @@ async fn cli_logs_reads_daemon_managed_task_log() {
 #[tokio::test]
 async fn cli_logs_merge_orders_aggregate_logs_by_timestamp() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "cli-log-merge-test"
 
         [tasks.alpha]
-        cmd = "sh"
-        args = ["-c", "printf '2026-05-19T00:00:02Z alpha-two\\n2026-05-19T00:00:04Z alpha-four\\n'"]
+        {}
 
         [tasks.beta]
-        cmd = "sh"
-        args = ["-c", "printf '2026-05-19T00:00:01Z beta-one\\n2026-05-19T00:00:03Z beta-three\\n'"]
+        {}
         "#,
-    )
+        common::print_task_command(
+            "2026-05-19T00:00:02Z alpha-two\n2026-05-19T00:00:04Z alpha-four\n"
+        ),
+        common::print_task_command(
+            "2026-05-19T00:00:01Z beta-one\n2026-05-19T00:00:03Z beta-three\n"
+        )
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let api = DaemonApi::new(runtime);
@@ -1052,7 +1115,7 @@ async fn cli_logs_merge_orders_aggregate_logs_by_timestamp() {
 
     let start = run_cli(&["--addr", &address.to_string(), "start", "all"]).await;
     assert!(start.status.success());
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let logs = run_cli(&["--addr", &address.to_string(), "logs", "--merge"]).await;
     let stdout = String::from_utf8_lossy(&logs.stdout);
@@ -1072,16 +1135,18 @@ async fn cli_logs_merge_orders_aggregate_logs_by_timestamp() {
 #[tokio::test]
 async fn cli_logs_since_filters_timestamped_lines() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "cli-log-since-test"
 
         [tasks.alpha]
-        cmd = "sh"
-        args = ["-c", "printf '2026-05-19T00:00:01Z old-line\\n2026-05-19T00:00:03Z new-line\\nwithout-time\\n'"]
+        {}
         "#,
-    )
+        common::print_task_command(
+            "2026-05-19T00:00:01Z old-line\n2026-05-19T00:00:03Z new-line\nwithout-time\n"
+        )
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let api = DaemonApi::new(runtime);
@@ -1101,7 +1166,7 @@ async fn cli_logs_since_filters_timestamped_lines() {
 
     let start = run_cli(&["--addr", &address.to_string(), "start", "all"]).await;
     assert!(start.status.success());
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let logs = run_cli(&[
         "--addr",
@@ -1133,14 +1198,14 @@ async fn cli_status_colors_status_and_health_columns() {
         name = "cli-color-test"
 
         [tasks.echo]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
 
         [tasks.echo.health]
         type = "file"
         path = "{}"
         "#,
-        ready_path.display()
+        common::sleep_task_command(),
+        common::toml_path(&ready_path)
     ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
@@ -1177,16 +1242,16 @@ async fn cli_status_colors_status_and_health_columns() {
 #[tokio::test]
 async fn cli_events_prints_daemon_lifecycle_events() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "cli-event-test"
 
         [tasks.echo]
-        cmd = "sh"
-        args = ["-c", "printf event"]
+        {}
         "#,
-    )
+        common::print_task_command("event")
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let api = DaemonApi::new(runtime);
@@ -1206,7 +1271,7 @@ async fn cli_events_prints_daemon_lifecycle_events() {
 
     let start = run_cli(&["--addr", &address.to_string(), "start", "echo"]).await;
     assert!(start.status.success());
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let events = run_cli(&["--addr", &address.to_string(), "events"]).await;
     let stdout = String::from_utf8_lossy(&events.stdout);
@@ -1315,12 +1380,29 @@ async fn cli_sends_configured_auth_token_to_daemon() {
 }
 
 async fn run_cli(args: &[&str]) -> std::process::Output {
+    let stdout_file = NamedTempFile::new().expect("stdout temp file");
+    let stderr_file = NamedTempFile::new().expect("stderr temp file");
+    let stdout_path = stdout_file.path().to_path_buf();
+    let stderr_path = stderr_file.path().to_path_buf();
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_rspm"));
     command.args(args);
-    tokio::time::timeout(Duration::from_secs(5), command.output())
-        .await
-        .expect("cli command timed out")
-        .expect("run cli")
+    command.kill_on_drop(true);
+    command.stdout(Stdio::from(
+        stdout_file.reopen().expect("reopen stdout temp file"),
+    ));
+    command.stderr(Stdio::from(
+        stderr_file.reopen().expect("reopen stderr temp file"),
+    ));
+
+    let status = match tokio::time::timeout(Duration::from_secs(45), command.status()).await {
+        Ok(status) => status.expect("run cli"),
+        Err(error) => panic!("cli command timed out args={args:?}: {error:?}"),
+    };
+    std::process::Output {
+        status,
+        stdout: fs::read(stdout_path).expect("read stdout temp file"),
+        stderr: fs::read(stderr_path).expect("read stderr temp file"),
+    }
 }
 
 async fn wait_for_daemon(address: SocketAddr) {

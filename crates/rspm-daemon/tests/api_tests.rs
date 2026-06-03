@@ -6,19 +6,21 @@ use rspm_daemon::api::DaemonApi;
 use rspm_daemon::runtime::TaskRuntime;
 use tempfile::TempDir;
 
+mod common;
+
 #[tokio::test]
 async fn daemon_api_handles_start_describe_list_and_stop() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "api-test"
 
         [tasks.sleeper]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
         "#,
-    )
+        common::sleep_task_command()
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let mut api = DaemonApi::new(runtime);
@@ -62,15 +64,16 @@ async fn daemon_api_handles_start_describe_list_and_stop() {
 #[tokio::test]
 async fn daemon_api_rejects_requests_with_missing_or_wrong_token() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "api-auth-test"
 
         [tasks.echo]
-        cmd = "true"
+        {}
         "#,
-    )
+        common::success_task_command()
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let mut api = DaemonApi::new(runtime).with_auth_token("secret-token");
@@ -104,21 +107,21 @@ async fn daemon_api_rejects_requests_with_missing_or_wrong_token() {
 #[tokio::test]
 async fn daemon_api_starts_and_stops_all_tasks_in_dag_order() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "api-all-test"
 
         [tasks.master]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
 
         [tasks.worker]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
         depends_on = ["master"]
         "#,
-    )
+        common::sleep_task_command(),
+        common::sleep_task_command()
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let mut api = DaemonApi::new(runtime);
@@ -147,15 +150,16 @@ async fn daemon_api_starts_and_stops_all_tasks_in_dag_order() {
 #[tokio::test]
 async fn daemon_api_returns_error_response_for_unknown_task() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "api-error-test"
 
         [tasks.master]
-        cmd = "true"
+        {}
         "#,
-    )
+        common::success_task_command()
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let mut api = DaemonApi::new(runtime);
@@ -176,15 +180,16 @@ async fn daemon_api_returns_error_response_for_unknown_task() {
 #[tokio::test]
 async fn daemon_api_reload_returns_explicit_not_configured_error() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "api-reload-test"
 
         [tasks.master]
-        cmd = "true"
+        {}
         "#,
-    )
+        common::success_task_command()
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let mut api = DaemonApi::new(runtime);
@@ -216,14 +221,14 @@ async fn daemon_api_reload_runs_configured_command() {
         name = "api-reload-command-test"
 
         [tasks.master]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
 
         [tasks.master.reload]
         mode = "command"
-        command = "touch {}"
+        command = "{}"
         "#,
-        marker.display()
+        common::sleep_task_command(),
+        common::toml_string(&common::touch_command(&marker))
     ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
@@ -314,16 +319,16 @@ async fn daemon_api_reload_sends_configured_signal() {
 #[tokio::test]
 async fn daemon_api_applies_new_config_and_stops_removed_tasks() {
     let temp = TempDir::new().expect("temp dir");
-    let initial = ProjectConfig::from_toml_str(
+    let initial = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "apply-test"
 
         [tasks.old]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
         "#,
-    )
+        common::sleep_task_command()
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(initial, temp.path()).expect("runtime");
     let mut api = DaemonApi::new(runtime);
@@ -331,18 +336,22 @@ async fn daemon_api_applies_new_config_and_stops_removed_tasks() {
     api.handle(RpcRequest::start("old"))
         .await
         .expect("start old");
+    let replacement_toml = format!(
+        r#"
+                    [project]
+                    name = "apply-test"
+
+                    [tasks.new]
+                    {}
+                "#,
+        common::success_task_command()
+    );
     let response = api
         .handle(RpcRequest::new(
             2,
             "config.apply",
             serde_json::json!({
-                "toml": r#"
-                    [project]
-                    name = "apply-test"
-
-                    [tasks.new]
-                    cmd = "true"
-                "#
+                "toml": replacement_toml
             }),
         ))
         .await
@@ -368,15 +377,16 @@ async fn daemon_api_applies_new_config_and_stops_removed_tasks() {
 #[tokio::test]
 async fn daemon_api_persists_applied_config_when_store_is_configured() {
     let temp = TempDir::new().expect("temp dir");
-    let initial = ProjectConfig::from_toml_str(
+    let initial = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "persist-apply-test"
 
         [tasks.old]
-        cmd = "true"
+        {}
         "#,
-    )
+        common::success_task_command()
+    ))
     .expect("valid config");
     let applied_path = temp.path().join("state").join("applied.toml");
     let runtime = TaskRuntime::new(initial, temp.path()).expect("runtime");
@@ -408,15 +418,16 @@ async fn daemon_api_persists_applied_config_when_store_is_configured() {
 async fn daemon_api_writes_lifecycle_events_to_jsonl_log() {
     let temp = TempDir::new().expect("temp dir");
     let event_path = temp.path().join("events").join("project.jsonl");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "event-jsonl-test"
 
         [tasks.echo]
-        cmd = "true"
+        {}
         "#,
-    )
+        common::success_task_command()
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path())
         .expect("runtime")
@@ -441,16 +452,16 @@ async fn daemon_api_writes_lifecycle_events_to_jsonl_log() {
 async fn runtime_restores_lifecycle_state_from_event_log() {
     let temp = TempDir::new().expect("temp dir");
     let event_path = temp.path().join("events").join("project.jsonl");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "event-restore-test"
 
         [tasks.echo]
-        cmd = "sh"
-        args = ["-c", "printf restore"]
+        {}
         "#,
-    )
+        common::print_task_command("restore")
+    ))
     .expect("valid config");
     let mut runtime = TaskRuntime::new(config.clone(), temp.path())
         .expect("runtime")
@@ -476,16 +487,16 @@ async fn runtime_restores_lifecycle_state_from_event_log() {
 async fn runtime_reattaches_running_task_pid_from_event_log() {
     let temp = TempDir::new().expect("temp dir");
     let event_path = temp.path().join("events").join("project.jsonl");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "reattach-test"
 
         [tasks.sleeper]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
         "#,
-    )
+        common::sleep_task_command()
+    ))
     .expect("valid config");
     let mut runtime = TaskRuntime::new(config.clone(), temp.path())
         .expect("runtime")
@@ -508,16 +519,16 @@ async fn runtime_reattaches_running_task_pid_from_event_log() {
 #[tokio::test]
 async fn daemon_api_lists_task_lifecycle_events() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "api-event-test"
 
         [tasks.echo]
-        cmd = "sh"
-        args = ["-c", "printf event"]
+        {}
         "#,
-    )
+        common::print_task_command("event")
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let mut api = DaemonApi::new(runtime);
@@ -548,16 +559,16 @@ async fn daemon_api_lists_task_lifecycle_events() {
 #[tokio::test]
 async fn daemon_api_returns_task_logs() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "api-log-test"
 
         [tasks.echo]
-        cmd = "sh"
-        args = ["-c", "printf hello-from-log"]
+        {}
         "#,
-    )
+        common::print_task_command("hello-from-log")
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let mut api = DaemonApi::new(runtime);

@@ -6,22 +6,24 @@ use rspm_daemon::runtime::TaskRuntime;
 use rspm_daemon::scheduler::run_due_actions;
 use tempfile::TempDir;
 
+mod common;
+
 #[tokio::test]
 async fn scheduler_tick_starts_due_task() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "scheduler-test"
 
         [tasks.sleeper]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
 
         [tasks.sleeper.schedule]
         start = "30 8 * * *"
         "#,
-    )
+        common::sleep_task_command()
+    ))
     .expect("valid config");
     let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let last = Utc.with_ymd_and_hms(2026, 5, 18, 8, 29, 0).unwrap();
@@ -42,7 +44,7 @@ async fn scheduler_tick_starts_due_task() {
 #[tokio::test]
 async fn task_info_reports_next_scheduled_action() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "next-info-test"
@@ -50,12 +52,13 @@ async fn task_info_reports_next_scheduled_action() {
         display_timezone = "Asia/Shanghai"
 
         [tasks.market]
-        cmd = "true"
+        {}
 
         [tasks.market.schedule]
         start = "30 8 * * *"
         "#,
-    )
+        common::success_task_command()
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
 
@@ -73,19 +76,19 @@ async fn task_info_reports_next_scheduled_action() {
 #[tokio::test]
 async fn daemon_maintenance_tick_runs_scheduler_actions() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "maintenance-test"
 
         [tasks.sleeper]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
 
         [tasks.sleeper.schedule]
         start = "30 8 * * *"
         "#,
-    )
+        common::sleep_task_command()
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let mut api = DaemonApi::new(runtime);

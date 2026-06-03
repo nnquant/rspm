@@ -7,6 +7,8 @@ use rspm_daemon::runtime::TaskRuntime;
 use rspm_daemon::runtime::{cpu_percent_from_proc_samples, ProcCpuSample};
 use tempfile::TempDir;
 
+mod common;
+
 fn config(input: &str) -> ProjectConfig {
     ProjectConfig::from_toml_str(input).expect("valid config")
 }
@@ -35,6 +37,27 @@ async fn reconcile_until_status(
     }
 }
 
+async fn reconcile_until_restart(
+    runtime: &mut TaskRuntime,
+    task_name: &str,
+) -> Vec<rspm_core::state::TaskInfo> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let restarted = runtime
+            .reconcile_exited_tasks()
+            .await
+            .expect("reconcile exits");
+        if !restarted.is_empty() {
+            return restarted;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task [{task_name}] did not restart before deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[test]
 fn computes_process_cpu_percent_from_proc_samples() {
     let sample = ProcCpuSample {
@@ -53,16 +76,16 @@ fn computes_process_cpu_percent_from_proc_samples() {
 #[tokio::test]
 async fn starts_task_and_captures_stdout_and_stderr_logs() {
     let temp = TempDir::new().expect("temp dir");
-    let config = config(
+    let config = config(&format!(
         r#"
         [project]
         name = "supervisor-test"
 
         [tasks.echo]
-        cmd = "sh"
-        args = ["-c", "printf hello; printf err >&2"]
+        {}
         "#,
-    );
+        common::print_stdout_stderr_task_command("hello", "err")
+    ));
     let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
 
     runtime.start_task("echo").await.expect("start task");
@@ -83,19 +106,19 @@ async fn starts_task_and_captures_stdout_and_stderr_logs() {
 #[tokio::test]
 async fn rotates_task_log_when_size_limit_is_reached() {
     let temp = TempDir::new().expect("temp dir");
-    let config = config(
+    let config = config(&format!(
         r#"
         [project]
         name = "log-rotation-test"
 
         [tasks.echo]
-        cmd = "sh"
-        args = ["-c", "printf new-log"]
+        {}
 
         [tasks.echo.logs]
         max_bytes = 3
         "#,
-    );
+        common::print_task_command("new-log")
+    ));
     let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let log_path = runtime.log_path("echo");
     fs::write(&log_path, "old-log").expect("old log");
@@ -113,16 +136,16 @@ async fn rotates_task_log_when_size_limit_is_reached() {
 #[tokio::test]
 async fn stops_long_running_task_and_updates_task_info() {
     let temp = TempDir::new().expect("temp dir");
-    let config = config(
+    let config = config(&format!(
         r#"
         [project]
         name = "supervisor-test"
 
         [tasks.sleeper]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
         "#,
-    );
+        common::sleep_task_command()
+    ));
     let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
 
     runtime.start_task("sleeper").await.expect("start task");
@@ -251,11 +274,6 @@ async fn restart_task_returns_restarting_without_waiting_for_kill_timeout() {
 async fn restarts_failed_task_according_to_restart_policy() {
     let temp = TempDir::new().expect("temp dir");
     let marker = temp.path().join("first-run");
-    let script = format!(
-        "if [ -f '{}' ]; then sleep 30; else touch '{}'; exit 1; fi",
-        marker.display(),
-        marker.display()
-    );
     let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
@@ -266,20 +284,15 @@ async fn restarts_failed_task_according_to_restart_policy() {
         max_restarts = 2
 
         [tasks.flaky]
-        cmd = "sh"
-        args = ["-c", "{}"]
+        {}
         "#,
-        script.replace('"', "\\\"")
+        common::flaky_once_task_command(&marker)
     ))
     .expect("valid config");
     let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
 
     runtime.start_task("flaky").await.expect("start task");
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let restarted = runtime
-        .reconcile_exited_tasks()
-        .await
-        .expect("reconcile exits");
+    let restarted = reconcile_until_restart(&mut runtime, "flaky").await;
     let info = runtime.describe_task("flaky").expect("task info");
 
     assert_eq!(restarted.len(), 1);
@@ -294,7 +307,7 @@ async fn restarts_failed_task_according_to_restart_policy() {
 #[tokio::test]
 async fn automatic_restart_respects_configured_restart_delay() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "restart-delay-test"
@@ -304,19 +317,16 @@ async fn automatic_restart_respects_configured_restart_delay() {
         restart_delay = "20ms"
 
         [tasks.flaky]
-        cmd = "false"
+        {}
         "#,
-    )
+        common::failure_task_command()
+    ))
     .expect("valid config");
     let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
 
     runtime.start_task("flaky").await.expect("start task");
-    tokio::time::sleep(Duration::from_millis(10)).await;
     let started = std::time::Instant::now();
-    let restarted = runtime
-        .reconcile_exited_tasks()
-        .await
-        .expect("reconcile exits");
+    let restarted = reconcile_until_restart(&mut runtime, "flaky").await;
 
     assert_eq!(restarted.len(), 1);
     assert!(started.elapsed() >= Duration::from_millis(20));
@@ -334,14 +344,17 @@ async fn restarts_task_when_watched_file_changes() {
         [project]
         name = "watch-test"
 
+        [defaults]
+        kill_timeout = "100ms"
+
         [tasks.worker]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
 
         [tasks.worker.watch]
         paths = ["{}"]
         "#,
-        watched.display()
+        common::sleep_task_command(),
+        common::toml_path(&watched)
     ))
     .expect("valid config");
     let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
@@ -361,6 +374,7 @@ async fn restarts_task_when_watched_file_changes() {
     assert_eq!(after.status, TaskStatus::Restarting);
     assert_eq!(before.pid, after.pid);
 
+    tokio::time::sleep(Duration::from_millis(150)).await;
     let after_restart = reconcile_until_status(&mut runtime, "worker", TaskStatus::Online).await;
     assert_ne!(before.pid, after_restart.pid);
 
@@ -374,19 +388,22 @@ async fn restarts_task_when_watched_file_changes() {
 #[tokio::test]
 async fn restarts_task_when_memory_limit_is_exceeded() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "memory-test"
 
+        [defaults]
+        kill_timeout = "100ms"
+
         [tasks.worker]
-        cmd = "sh"
-        args = ["-c", "sleep 30"]
+        {}
 
         [tasks.worker.limits]
         max_memory_bytes = 10
         "#,
-    )
+        common::sleep_task_command()
+    ))
     .expect("valid config");
     let mut runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
 
@@ -402,6 +419,7 @@ async fn restarts_task_when_memory_limit_is_exceeded() {
     assert_eq!(after.status, TaskStatus::Restarting);
     assert_eq!(before.pid, after.pid);
 
+    tokio::time::sleep(Duration::from_millis(150)).await;
     let after_restart = reconcile_until_status(&mut runtime, "worker", TaskStatus::Online).await;
     assert_ne!(before.pid, after_restart.pid);
 

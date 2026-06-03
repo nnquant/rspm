@@ -5,6 +5,9 @@ use rspm_sdk::api::{RpcRequest, RpcResponse};
 use rspm_sdk::RspmClient;
 use tempfile::TempDir;
 
+#[path = "../../rspm-daemon/tests/common/mod.rs"]
+mod common;
+
 #[test]
 fn serializes_json_rpc_style_start_request() {
     let request = RpcRequest::start("master");
@@ -27,16 +30,16 @@ fn serializes_success_response_with_task_payload() {
 #[tokio::test]
 async fn in_process_client_starts_and_lists_tasks() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "sdk-test"
 
         [tasks.echo]
-        cmd = "sh"
-        args = ["-c", "printf sdk"]
+        {}
         "#,
-    )
+        common::print_task_command("sdk")
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let mut client = RspmClient::from_runtime(runtime);
@@ -53,20 +56,20 @@ async fn in_process_client_starts_and_lists_tasks() {
 #[tokio::test]
 async fn in_process_client_reads_aggregate_task_logs() {
     let temp = TempDir::new().expect("temp dir");
-    let config = ProjectConfig::from_toml_str(
+    let config = ProjectConfig::from_toml_str(&format!(
         r#"
         [project]
         name = "sdk-aggregate-logs-test"
 
         [tasks.alpha]
-        cmd = "sh"
-        args = ["-c", "printf alpha-log"]
+        {}
 
         [tasks.beta]
-        cmd = "sh"
-        args = ["-c", "printf beta-log"]
+        {}
         "#,
-    )
+        common::print_task_command("alpha-log"),
+        common::print_task_command("beta-log")
+    ))
     .expect("valid config");
     let runtime = TaskRuntime::new(config, temp.path()).expect("runtime");
     let mut client = RspmClient::from_runtime(runtime);

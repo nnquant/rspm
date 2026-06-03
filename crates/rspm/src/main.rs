@@ -1181,8 +1181,16 @@ impl DaemonLaunch {
         if !self.auto_launch {
             return Ok(self.addr);
         }
-        if probe_daemon(self.addr, self.token()).await.is_ok() {
-            return Ok(self.addr);
+        match probe_daemon(self.addr, self.token()).await {
+            Ok(_) => return Ok(self.addr),
+            Err(error) => {
+                if !wait_for_tcp_addr_available(self.addr).await {
+                    anyhow::bail!(
+                        "rspmd is not responding at [{}], and the address is still in use: {error}",
+                        self.addr
+                    );
+                }
+            }
         }
         self.spawn(config)?;
         wait_for_daemon(self.addr, self.token()).await?;
@@ -1282,7 +1290,17 @@ fn detach_daemon_command(command: &mut StdCommand) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn detach_daemon_command(command: &mut StdCommand) {
+    use std::os::windows::process::CommandExt;
+
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(not(any(unix, windows)))]
 fn detach_daemon_command(_command: &mut StdCommand) {}
 
 async fn wait_for_daemon(addr: SocketAddr, token: Option<&str>) -> Result<()> {
@@ -1301,8 +1319,9 @@ async fn wait_for_daemon(addr: SocketAddr, token: Option<&str>) -> Result<()> {
 }
 
 async fn wait_for_daemon_exit(addr: SocketAddr, token: Option<&str>) -> Result<()> {
-    for _ in 0..100 {
-        if probe_daemon(addr, token).await.is_err() {
+    let _ = token;
+    for _ in 0..300 {
+        if !tcp_port_open(addr).await {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1310,11 +1329,34 @@ async fn wait_for_daemon_exit(addr: SocketAddr, token: Option<&str>) -> Result<(
     anyhow::bail!("rspmd did not stop at [{addr}]");
 }
 
+async fn wait_for_tcp_addr_available(addr: SocketAddr) -> bool {
+    for _ in 0..20 {
+        if std::net::TcpListener::bind(addr).is_ok() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+async fn tcp_port_open(addr: SocketAddr) -> bool {
+    tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
 async fn probe_daemon(addr: SocketAddr, token: Option<&str>) -> Result<()> {
-    let mut client = tcp_client(addr, token).await?;
-    let response = client
-        .send(RpcRequest::new(1, "task.list", serde_json::json!({})))
-        .await?;
+    let response = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        let mut client = tcp_client(addr, token).await?;
+        client
+            .send(RpcRequest::new(1, "task.list", serde_json::json!({})))
+            .await
+    })
+    .await
+    .context("rspmd probe timed out")??;
     if let Some(error) = response.error {
         anyhow::bail!("rspmd probe failed [{}]: {}", error.code, error.message);
     }
